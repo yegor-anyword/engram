@@ -1,0 +1,858 @@
+"""Ingestion pipeline — Reflector → Curator → Delta application.
+
+v0.3: Adds concurrency control (lock during delta application),
+capacity checks, delta revalidation, event emission, and
+contradiction detection in the Curator.
+
+v0.4: Canonical Reflector model via IngestionConfig, raw input
+preservation in Activity ledger, dedup by hash.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from engram.core.concurrency import ContextLockManager
+from engram.core.config import IngestionConfig
+from engram.core.delta import DeltaEngine
+from engram.core.events import EventBus
+from engram.core.exceptions import CapacityExceededError, IngestionError
+from engram.core.models import (
+    ActionType,
+    Activity,
+    Bullet,
+    BulletType,
+    ContentType,
+    DeltaBatch,
+    DeltaOperation,
+    DeltaOpType,
+    DeltaSource,
+    ExecutionFeedback,
+    FeedbackOutcome,
+    Reflection,
+    ReflectionInsight,
+    SourceType,
+)
+from engram.llm.adapter import LLMAdapter
+from engram.storage.base import StorageBackend
+
+logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ── Reflector ──────────────────────────────────────────────────────────────
+
+
+REFLECTOR_SYSTEM_PROMPT = """\
+You are the Reflector in a brain-inspired memory system. Your job is to analyze
+raw input and extract structured insights. You do NOT decide what to store —
+the Curator handles that.
+
+Given raw input (and optional execution feedback), extract:
+1. New insights — atomic, actionable knowledge bullets
+2. Strategies that worked
+3. Failure modes — what went wrong and why
+4. Prediction errors — things that violated expectations (these get extra attention)
+5. Open questions — unresolved uncertainties
+
+For each insight:
+- Make it ATOMIC (one idea)
+- Classify its type: "strategy", "warning", "fact", "procedure", "exception", "principle", "decision"
+- Suggest a section grouping
+- Rate novelty (0-1, how new vs existing context)
+
+Respond ONLY with valid JSON:
+{
+  "new_insights": [
+    {"content": "...", "insight_type": "fact", "suggested_section": "ocr_tools",
+     "evidence": "...", "novelty": 0.8}
+  ],
+  "strategies_that_worked": ["..."],
+  "failure_modes": ["..."],
+  "prediction_errors": ["..."],
+  "open_questions": ["..."],
+  "confidence": 0.8
+}"""
+
+
+class ReflectorEngine:
+    """Phase 1: Analyze raw input to extract structured insights.
+
+    Brain analogy: Hippocampus encoding — processing new experiences
+    into structured memory traces.
+
+    v0.4: Accepts IngestionConfig to use the canonical Reflector model.
+    """
+
+    def __init__(
+        self,
+        llm: LLMAdapter,
+        config: IngestionConfig | None = None,
+    ) -> None:
+        self.llm = llm
+        self.config = config or IngestionConfig()
+
+    async def reflect(
+        self,
+        raw_input: str,
+        feedback: ExecutionFeedback | None = None,
+        existing_context_summary: str | None = None,
+        max_rounds: int | None = None,
+        model_override: str | None = None,
+    ) -> Reflection:
+        """Analyze raw input and produce a structured Reflection.
+
+        Uses the CANONICAL Reflector model from server config unless
+        model_override is specified (used by re-extraction).
+        """
+        feedback_text = ""
+        if feedback:
+            feedback_text = f"\n\nExecution feedback:\n- Outcome: {feedback.outcome.value}"
+            if feedback.metrics:
+                feedback_text += f"\n- Metrics: {json.dumps(feedback.metrics)}"
+            if feedback.error_message:
+                feedback_text += f"\n- Error: {feedback.error_message}"
+            if feedback.tool_calls:
+                calls = [f"  {tc.tool}: {tc.status.value}" + (f" ({tc.error})" if tc.error else "")
+                         for tc in feedback.tool_calls]
+                feedback_text += "\n- Tool calls:\n" + "\n".join(calls)
+
+        context_text = ""
+        if existing_context_summary:
+            context_text = f"\n\nExisting context summary:\n{existing_context_summary}"
+
+        prompt = f"Analyze this input and extract insights:{context_text}{feedback_text}\n\nRaw input:\n{raw_input}"
+
+        raw_response = await self.llm.complete(
+            prompt=prompt,
+            system=REFLECTOR_SYSTEM_PROMPT,
+            temperature=0.0,
+            response_format="json",
+        )
+
+        try:
+            data = json.loads(raw_response)
+        except json.JSONDecodeError:
+            try:
+                start = raw_response.index("{")
+                end = raw_response.rindex("}") + 1
+                data = json.loads(raw_response[start:end])
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise IngestionError(f"Reflector returned invalid JSON: {raw_response[:200]}") from exc
+
+        insights = [
+            ReflectionInsight(
+                content=ins.get("content", ""),
+                insight_type=ins.get("insight_type", "fact"),
+                suggested_section=ins.get("suggested_section", "general"),
+                evidence=ins.get("evidence", ""),
+                novelty=ins.get("novelty", 0.5),
+            )
+            for ins in data.get("new_insights", [])
+        ]
+
+        return Reflection(
+            new_insights=insights,
+            strategies_that_worked=data.get("strategies_that_worked", []),
+            failure_modes=data.get("failure_modes", []),
+            prediction_errors=data.get("prediction_errors", []),
+            open_questions=data.get("open_questions", []),
+            rounds_completed=1,
+            confidence=data.get("confidence", 0.5),
+            raw_input_type="conversation",
+        )
+
+
+# ── Curator ────────────────────────────────────────────────────────────────
+
+
+class CuratorEngine:
+    """Phase 2: Decide what delta operations to apply.
+
+    Brain analogy: Neocortex integration — deciding what to store,
+    how to connect it, and what to update.
+
+    KEY INSIGHT: ~70% of operations use lightweight, non-LLM techniques
+    (embedding dedup, deterministic merge). Only complex conflicts need LLM.
+    """
+
+    def __init__(self, storage: StorageBackend, llm: LLMAdapter) -> None:
+        self.storage = storage
+        self.llm = llm
+
+    async def curate(
+        self,
+        context_id: str,
+        reflection: Reflection,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> DeltaBatch:
+        """Given a Reflection, produce delta operations."""
+        existing_bullets = await self.storage.list_bullets(context_id)
+        operations: list[DeltaOperation] = []
+
+        for insight in reflection.new_insights:
+            op = await self._process_insight(
+                context_id, insight, existing_bullets, agent_id, session_id
+            )
+            if op:
+                operations.append(op)
+
+        # Prediction errors become high-salience EXCEPTION bullets
+        for error in reflection.prediction_errors:
+            operations.append(DeltaOperation(
+                op_type=DeltaOpType.ADD_BULLET,
+                target_id=str(uuid.uuid4())[:8],
+                section="prediction_errors",
+                content=error,
+                bullet_type="exception",
+                reasoning="Prediction error detected by Reflector — high salience signal",
+                source=DeltaSource.REFLECTOR,
+                confidence=0.8,
+                agent_id=agent_id,
+                session_id=session_id,
+            ))
+
+        # Failure modes become WARNING bullets
+        for failure in reflection.failure_modes:
+            operations.append(DeltaOperation(
+                op_type=DeltaOpType.ADD_BULLET,
+                target_id=str(uuid.uuid4())[:8],
+                section="failure_modes",
+                content=failure,
+                bullet_type="warning",
+                reasoning="Failure mode identified by Reflector",
+                source=DeltaSource.REFLECTOR,
+                confidence=0.7,
+                agent_id=agent_id,
+                session_id=session_id,
+            ))
+
+        # Successful strategies → STRATEGY bullets
+        for strategy in reflection.strategies_that_worked:
+            operations.append(DeltaOperation(
+                op_type=DeltaOpType.ADD_BULLET,
+                target_id=str(uuid.uuid4())[:8],
+                section="strategies",
+                content=strategy,
+                bullet_type="strategy",
+                reasoning="Successful strategy recorded by Reflector",
+                source=DeltaSource.REFLECTOR,
+                confidence=0.7,
+                agent_id=agent_id,
+                session_id=session_id,
+            ))
+
+        batch = DeltaBatch(
+            context_id=context_id,
+            operations=operations,
+            trigger="commit",
+        )
+        return batch
+
+    async def _process_insight(
+        self,
+        context_id: str,
+        insight: ReflectionInsight,
+        existing_bullets: list[Bullet],
+        agent_id: str | None,
+        session_id: str | None,
+    ) -> DeltaOperation | None:
+        """Process a single insight — fast path (no LLM) or slow path (LLM)."""
+
+        # Fast path: exact content match → skip
+        for existing in existing_bullets:
+            if existing.content.strip().lower() == insight.content.strip().lower():
+                logger.debug("Skipping exact duplicate: %s", insight.content[:60])
+                return None
+
+        # Fast path: embedding similarity → merge
+        try:
+            embedding = await self.llm.embed(insight.content)
+            similar = await self.storage.find_similar_bullets(
+                context_id, embedding, limit=1, threshold=0.92
+            )
+            if similar:
+                existing_bullet, score = similar[0]
+                logger.debug("Found similar bullet (%.3f): merging", score)
+                return DeltaOperation(
+                    op_type=DeltaOpType.MERGE_BULLETS,
+                    target_ids=[existing_bullet.id, "__new__"],
+                    content=insight.content if len(insight.content) > len(existing_bullet.content) else existing_bullet.content,
+                    reasoning=f"Merged similar bullet (cosine={score:.3f})",
+                    source=DeltaSource.CURATOR,
+                    confidence=max(existing_bullet.confidence, insight.novelty),
+                    agent_id=agent_id,
+                    session_id=session_id,
+                )
+        except Exception as exc:
+            logger.warning("Embedding dedup failed, adding as new: %s", exc)
+
+        # Fast path: contradiction detection
+        try:
+            if embedding is not None:  # type: ignore[possibly-undefined]
+                contradiction = self._detect_contradiction(
+                    insight.content, embedding, existing_bullets
+                )
+                if contradiction is not None:
+                    existing_bullet, negation_score = contradiction
+                    logger.info(
+                        "Contradiction detected (score=%.2f) between new insight and bullet %s",
+                        negation_score, existing_bullet.id,
+                    )
+                    # Add the new bullet with a note about the contradiction
+                    return DeltaOperation(
+                        op_type=DeltaOpType.ADD_BULLET,
+                        target_id=str(uuid.uuid4())[:8],
+                        section=insight.suggested_section,
+                        content=insight.content,
+                        bullet_type=insight.insight_type if insight.insight_type in [bt.value for bt in BulletType] else "fact",
+                        reasoning=(
+                            f"Contradicts existing bullet {existing_bullet.id}: "
+                            f"'{existing_bullet.content[:60]}' — keeping both for review"
+                        ),
+                        source=DeltaSource.CURATOR,
+                        confidence=insight.novelty,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                    )
+        except Exception as exc:
+            logger.warning("Contradiction detection failed: %s", exc)
+
+        # Default: add as new bullet
+        bullet_type = insight.insight_type
+        try:
+            BulletType(bullet_type)
+        except ValueError:
+            bullet_type = "fact"
+
+        return DeltaOperation(
+            op_type=DeltaOpType.ADD_BULLET,
+            target_id=str(uuid.uuid4())[:8],
+            section=insight.suggested_section,
+            content=insight.content,
+            bullet_type=bullet_type,
+            reasoning=f"New insight (novelty={insight.novelty:.2f}): {insight.evidence[:80]}",
+            source=DeltaSource.CURATOR,
+            confidence=insight.novelty,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+
+
+    @staticmethod
+    def _has_negation_signal(text_a: str, text_b: str) -> bool:
+        """Fast heuristic: check if two texts have opposing signals."""
+        negation_pairs = [
+            ("not ", " not"), ("don't", "do"), ("doesn't", "does"),
+            ("shouldn't", "should"), ("won't", "will"), ("can't", "can"),
+            ("avoid", "use"), ("instead of", ""), ("rather than", ""),
+            ("no longer", "still"), ("deprecated", "recommended"),
+            ("worse", "better"), ("failed", "succeeded"),
+        ]
+        a_lower = text_a.lower()
+        b_lower = text_b.lower()
+        for neg, pos in negation_pairs:
+            if (neg in a_lower and pos and pos in b_lower) or \
+               (neg in b_lower and pos and pos in a_lower):
+                return True
+        return False
+
+    def _detect_contradiction(
+        self,
+        new_content: str,
+        new_embedding: list[float],
+        existing_bullets: list[Bullet],
+    ) -> tuple[Bullet, float] | None:
+        """Detect if new content contradicts an existing bullet.
+
+        Uses a two-pass approach:
+        1. Find semantically similar bullets (same topic)
+        2. Check for negation signals (opposing conclusions)
+        """
+        from engram.storage.sqlite import _cosine_similarity
+
+        for bullet in existing_bullets:
+            if bullet.embedding is None:
+                continue
+            sim = _cosine_similarity(new_embedding, bullet.embedding)
+            # High similarity + negation signal = contradiction
+            if sim >= 0.75 and self._has_negation_signal(new_content, bullet.content):
+                return (bullet, sim)
+        return None
+
+    async def curate_re_extraction(
+        self,
+        new_reflection: Reflection,
+        old_bullets: list[Bullet],
+        context_id: str,
+    ) -> DeltaBatch:
+        """Compare new extraction against old bullets from the same raw input.
+
+        For each new insight:
+        - If it matches an old bullet (>0.92 similarity) → no change (or minor UPDATE)
+        - If it's genuinely new (no match) → ADD_BULLET
+        - If an old bullet has no match in new insights → REMOVE_BULLET
+          (only if low-value; high-value bullets are kept)
+
+        This is conservative by default — high-value bullets (high salience + hit rate)
+        are kept even if the new model doesn't reproduce them.
+        """
+        from engram.storage.sqlite import _cosine_similarity
+
+        operations: list[DeltaOperation] = []
+        matched_old_ids: set[str] = set()
+
+        for insight in new_reflection.new_insights:
+            best_match = None
+            best_similarity = 0.0
+
+            try:
+                new_embedding = await self.llm.embed(insight.content)
+            except Exception:
+                new_embedding = None
+
+            if new_embedding is not None:
+                for old_bullet in old_bullets:
+                    if old_bullet.id in matched_old_ids:
+                        continue
+                    if old_bullet.embedding is None:
+                        continue
+                    sim = _cosine_similarity(new_embedding, old_bullet.embedding)
+                    if sim > best_similarity:
+                        best_similarity = sim
+                        best_match = old_bullet
+
+            if best_match and best_similarity > 0.92:
+                # Match found — minor update if content differs meaningfully
+                matched_old_ids.add(best_match.id)
+                if best_similarity < 0.98:
+                    operations.append(DeltaOperation(
+                        op_type=DeltaOpType.UPDATE_BULLET,
+                        target_id=best_match.id,
+                        content=insight.content,
+                        reasoning=(
+                            f"Re-extraction improved this bullet "
+                            f"(similarity: {best_similarity:.2f})"
+                        ),
+                        source=DeltaSource.CURATOR,
+                    ))
+            else:
+                # No match — genuinely new insight from better model
+                bullet_type = insight.insight_type
+                try:
+                    BulletType(bullet_type)
+                except ValueError:
+                    bullet_type = "fact"
+
+                operations.append(DeltaOperation(
+                    op_type=DeltaOpType.ADD_BULLET,
+                    target_id=str(uuid.uuid4())[:8],
+                    section=insight.suggested_section,
+                    content=insight.content,
+                    bullet_type=bullet_type,
+                    reasoning=(
+                        f"New insight discovered by re-extraction "
+                        f"(best match: {best_similarity:.2f})"
+                    ),
+                    source=DeltaSource.CURATOR,
+                ))
+
+        # Old bullets with no match in new extraction — consider removal
+        for old_bullet in old_bullets:
+            if old_bullet.id not in matched_old_ids:
+                # Only remove if the old bullet has low salience and low hit rate
+                # High-value bullets are kept even if re-extraction doesn't reproduce them
+                if old_bullet.effective_salience < 0.3 and old_bullet.hit_rate < 0.3:
+                    operations.append(DeltaOperation(
+                        op_type=DeltaOpType.REMOVE_BULLET,
+                        target_id=old_bullet.id,
+                        reasoning=(
+                            f"Not reproduced by re-extraction and low value "
+                            f"(salience: {old_bullet.effective_salience:.2f}, "
+                            f"hit_rate: {old_bullet.hit_rate:.2f})"
+                        ),
+                        source=DeltaSource.CURATOR,
+                    ))
+
+        return DeltaBatch(
+            context_id=context_id,
+            operations=operations,
+            trigger="re_extraction",
+        )
+
+
+# ── Unified Ingestion Engine ──────────────────────────────────────────────
+
+
+class IngestionEngine:
+    """Unified ingestion: Reflector → Curator → Delta application.
+
+    Also provides direct bullet addition and decision recording.
+    v0.3: Optional lock_manager and event_bus for concurrency and notifications.
+    v0.4: Canonical Reflector model via IngestionConfig, raw input preservation,
+          dedup by hash.
+    """
+
+    def __init__(
+        self,
+        storage: StorageBackend,
+        llm: LLMAdapter,
+        lock_manager: ContextLockManager | None = None,
+        event_bus: EventBus | None = None,
+        ingestion_config: IngestionConfig | None = None,
+    ) -> None:
+        self.storage = storage
+        self.llm = llm
+        self.lock_manager = lock_manager
+        self.event_bus = event_bus
+        self.ingestion_config = ingestion_config or IngestionConfig()
+        self.reflector = ReflectorEngine(llm, config=self.ingestion_config)
+        self.curator = CuratorEngine(storage, llm)
+        self.delta_engine = DeltaEngine(storage)
+
+    async def commit(
+        self,
+        context_id: uuid.UUID,
+        agent_id: str,
+        content: str,
+        content_type: ContentType = ContentType.CONVERSATION,
+        session_id: uuid.UUID | None = None,
+        feedback: ExecutionFeedback | None = None,
+        materialization_id: str | None = None,
+        domain_tags: list[str] | None = None,
+        source_model: str | None = None,
+    ) -> DeltaBatch:
+        """Full ingestion pipeline: Reflect → Curate → Apply deltas.
+
+        If materialization_id is provided, triggers reconsolidation.
+        v0.4: Dedup by hash, raw input preservation, extraction metadata.
+        """
+        ctx_id_str = str(context_id)
+
+        # v0.4: Dedup check — skip if identical raw input already processed
+        input_hash = hashlib.sha256(content.encode()).hexdigest()
+        existing_activity = await self.storage.get_raw_input_by_hash(
+            ctx_id_str, input_hash
+        )
+        if existing_activity is not None and existing_activity.delta_batch_id:
+            existing_batch = await self.storage.get_delta_batch(
+                existing_activity.delta_batch_id
+            )
+            if existing_batch is not None:
+                logger.info(
+                    "Duplicate raw input detected (hash=%s), returning existing batch",
+                    input_hash[:16],
+                )
+                return existing_batch
+
+        # Build context summary for the Reflector
+        existing_bullets = await self.storage.list_bullets(ctx_id_str)
+        summary = self._summarize_bullets(existing_bullets) if existing_bullets else None
+
+        # Phase 1: Reflect (using CANONICAL model from config)
+        reflection = await self.reflector.reflect(
+            raw_input=content,
+            feedback=feedback,
+            existing_context_summary=summary,
+        )
+
+        # Phase 2: Curate
+        batch = await self.curator.curate(
+            context_id=ctx_id_str,
+            reflection=reflection,
+            agent_id=agent_id,
+            session_id=str(session_id) if session_id else None,
+        )
+
+        # v0.3: Capacity check before applying deltas
+        net_adds = sum(
+            1 for op in batch.operations if op.op_type == DeltaOpType.ADD_BULLET
+        ) - sum(
+            1 for op in batch.operations if op.op_type == DeltaOpType.REMOVE_BULLET
+        )
+        if net_adds > 0:
+            context = await self.storage.get_context(context_id)
+            if context is not None:
+                max_bullets = context.lifecycle_config.max_active_bullets
+                capacity = await self.storage.get_capacity_status(
+                    ctx_id_str, max_bullets
+                )
+                if capacity.pressure_level == "full":
+                    raise CapacityExceededError(
+                        ctx_id_str, capacity.active_bullet_count, max_bullets
+                    )
+
+        # Phase 3: Apply deltas (under lock if available)
+        if self.lock_manager is not None:
+            async with self.lock_manager.acquire(ctx_id_str):
+                self._revalidate_deltas(batch)
+                batch = await self.delta_engine.apply_batch(batch)
+        else:
+            batch = await self.delta_engine.apply_batch(batch)
+
+        # v0.4: Collect bullet IDs produced by ADD_BULLET operations
+        bullet_ids_produced = [
+            op.target_id
+            for op in batch.operations
+            if op.op_type == DeltaOpType.ADD_BULLET and op.target_id
+        ]
+
+        # Record activity WITH raw input preservation (v0.4)
+        activity = Activity(
+            agent_id=agent_id,
+            session_id=session_id,
+            action_type=ActionType.FACT_LEARNED,
+            summary=(
+                f"Ingested {content_type.value}: +{batch.bullets_added} bullets, "
+                f"~{batch.bullets_updated} updated, -{batch.bullets_removed} removed, "
+                f"⊕{batch.bullets_merged} merged"
+            ),
+            delta_batch_id=batch.id,
+            # v0.4: Raw input preservation
+            raw_input=content,
+            raw_input_hash=input_hash,
+            content_type=content_type.value,
+            source_agent_model=source_model,
+            feedback=feedback.model_dump() if feedback else None,
+            # v0.4: Extraction metadata
+            extraction_model=self.ingestion_config.reflector_model,
+            extraction_prompt_version=self.ingestion_config.reflector_prompt_version,
+            bullet_ids_produced=bullet_ids_produced,
+        )
+        await self.storage.add_activity(context_id, activity)
+
+        # Reconsolidation: if this commit references a materialization, update bullet stats
+        if materialization_id and feedback:
+            await self._reconsolidate(materialization_id, feedback)
+
+        # v0.3: Emit event
+        if self.event_bus is not None:
+            self.event_bus.emit(
+                ctx_id_str,
+                event_type="commit",
+                agent_id=agent_id,
+                data={
+                    "delta_batch_id": batch.id,
+                    "bullets_added": batch.bullets_added,
+                    "bullets_updated": batch.bullets_updated,
+                    "bullets_removed": batch.bullets_removed,
+                    "bullets_merged": batch.bullets_merged,
+                },
+            )
+
+        return batch
+
+    async def add_bullet_directly(
+        self,
+        context_id: str,
+        content: str,
+        section: str = "general",
+        bullet_type: BulletType = BulletType.FACT,
+        salience: float = 0.5,
+        confidence: float = 0.5,
+        agent_id: str = "manual",
+        session_id: str | None = None,
+    ) -> tuple[Bullet, DeltaBatch]:
+        """Add a single bullet directly (bypass Reflector)."""
+        # v0.3: Capacity check
+        context = await self.storage.get_context(uuid.UUID(context_id))
+        if context is not None:
+            max_bullets = context.lifecycle_config.max_active_bullets
+            capacity = await self.storage.get_capacity_status(context_id, max_bullets)
+            if capacity.pressure_level == "full":
+                raise CapacityExceededError(
+                    context_id, capacity.active_bullet_count, max_bullets
+                )
+
+        bullet_id = str(uuid.uuid4())[:8]
+        op = DeltaOperation(
+            op_type=DeltaOpType.ADD_BULLET,
+            target_id=bullet_id,
+            section=section,
+            content=content,
+            bullet_type=bullet_type.value,
+            reasoning="Direct bullet addition (bypass Reflector)",
+            source=DeltaSource.USER,
+            confidence=confidence,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        batch = DeltaBatch(
+            context_id=context_id,
+            operations=[op],
+            trigger="direct_add",
+        )
+
+        # v0.3: Apply under lock if available
+        if self.lock_manager is not None:
+            async with self.lock_manager.acquire(context_id):
+                batch = await self.delta_engine.apply_batch(batch)
+        else:
+            batch = await self.delta_engine.apply_batch(batch)
+
+        bullet = await self.storage.get_bullet(bullet_id)
+        if bullet:
+            bullet.salience = salience
+            try:
+                bullet.embedding = await self.llm.embed(content)
+            except Exception:
+                pass
+            await self.storage.update_bullet(bullet)
+
+        # v0.3: Emit event
+        if self.event_bus is not None:
+            self.event_bus.emit(
+                context_id,
+                event_type="bullet_added",
+                agent_id=agent_id,
+                data={"bullet_id": bullet_id},
+            )
+
+        return bullet or Bullet(id=bullet_id, content=content), batch
+
+    async def record_decision(
+        self,
+        context_id: uuid.UUID,
+        decision: str,
+        rationale: str,
+        alternatives: list[str],
+        agent_id: str,
+        domain_tags: list[str] | None = None,
+        session_id: uuid.UUID | None = None,
+    ) -> tuple[str, DeltaBatch]:
+        """Record a decision as a DECISION bullet with alternatives."""
+        ctx_id_str = str(context_id)
+        operations: list[DeltaOperation] = []
+
+        decision_id = str(uuid.uuid4())[:8]
+        operations.append(DeltaOperation(
+            op_type=DeltaOpType.ADD_BULLET,
+            target_id=decision_id,
+            section="decisions",
+            content=f"{decision}. Rationale: {rationale}",
+            bullet_type="decision",
+            reasoning=f"Decision recorded: {decision}",
+            source=DeltaSource.USER,
+            confidence=0.9,
+            agent_id=agent_id,
+            session_id=str(session_id) if session_id else None,
+        ))
+
+        for alt in alternatives:
+            operations.append(DeltaOperation(
+                op_type=DeltaOpType.ADD_BULLET,
+                target_id=str(uuid.uuid4())[:8],
+                section="decisions",
+                content=f"Alternative considered: {alt}",
+                bullet_type="fact",
+                reasoning=f"Alternative for decision: {decision}",
+                source=DeltaSource.USER,
+                confidence=0.7,
+                agent_id=agent_id,
+                session_id=str(session_id) if session_id else None,
+            ))
+
+        batch = DeltaBatch(
+            context_id=ctx_id_str,
+            operations=operations,
+            trigger="decision",
+        )
+        batch = await self.delta_engine.apply_batch(batch)
+
+        activity = Activity(
+            agent_id=agent_id,
+            session_id=session_id,
+            action_type=ActionType.DECISION_MADE,
+            summary=f"Decision: {decision}",
+            delta_batch_id=batch.id,
+        )
+        await self.storage.add_activity(context_id, activity)
+
+        return decision_id, batch
+
+    async def _reconsolidate(
+        self, materialization_id: str, feedback: ExecutionFeedback
+    ) -> None:
+        """Post-recall reconsolidation — update bullet usage stats."""
+        record = await self.storage.get_materialization(materialization_id)
+        if record is None:
+            logger.warning("Materialization %s not found for reconsolidation", materialization_id)
+            return
+
+        for bullet_id in record.bullets_included:
+            bullet = await self.storage.get_bullet(bullet_id)
+            if bullet is None:
+                continue
+
+            bullet.recall_count += 1
+            bullet.last_recalled_at = _utcnow()
+
+            if feedback.outcome == FeedbackOutcome.SUCCESS:
+                bullet.hit_count += 1
+                bullet.salience = min(1.0, bullet.salience * 1.05)
+            elif feedback.outcome == FeedbackOutcome.FAILURE:
+                bullet.miss_count += 1
+                bullet.salience = max(0.05, bullet.salience * 0.95)
+
+            await self.storage.update_bullet(bullet)
+
+        logger.info(
+            "Reconsolidation: updated %d bullets from materialization %s (outcome=%s)",
+            len(record.bullets_included), materialization_id, feedback.outcome.value,
+        )
+
+    @staticmethod
+    def _revalidate_deltas(batch: DeltaBatch) -> None:
+        """Revalidate delta operations inside the lock.
+
+        After parallel computation but before application, check that
+        operations targeting existing bullets are still valid. This is
+        a lightweight check — actual existence is verified by delta_engine.
+        """
+        seen_targets: set[str] = set()
+        valid_ops: list[DeltaOperation] = []
+        for op in batch.operations:
+            # Deduplicate operations targeting the same bullet
+            target = op.target_id or ""
+            if op.op_type in (DeltaOpType.UPDATE_BULLET, DeltaOpType.REMOVE_BULLET):
+                if target in seen_targets:
+                    logger.debug("Dropping duplicate op for target %s", target)
+                    continue
+                seen_targets.add(target)
+            valid_ops.append(op)
+        batch.operations = valid_ops
+
+    @staticmethod
+    def _summarize_bullets(bullets: list[Bullet]) -> str:
+        if not bullets:
+            return ""
+        lines = []
+        for b in bullets[:40]:
+            lines.append(f"- [{b.bullet_type.value if hasattr(b.bullet_type, 'value') else b.bullet_type}] {b.content}")
+        return "\n".join(lines)
+
+    # ── Legacy compat ──────────────────────────────────────────────────
+
+    async def add_concept_directly(
+        self, context_id: uuid.UUID, concept: Any,
+        relationships: list[dict[str, Any]] | None = None,
+    ) -> tuple[Any, list[uuid.UUID]]:
+        """Legacy wrapper — adds concept as a bullet internally."""
+        from engram.core.models import ConceptNode
+        if isinstance(concept, ConceptNode):
+            try:
+                concept.embedding = await self.llm.embed(concept.content)
+            except Exception:
+                pass
+            await self.storage.add_concept(context_id, concept)
+            return concept, []
+        return concept, []

@@ -1,0 +1,35 @@
+services:
+  engram:
+    build: .
+    ports:
+      - "5820:5820"
+    environment:
+      ENGRAM_STORAGE_BACKEND: postgres
+      ENGRAM_POSTGRES_URL: postgresql://engram:engram@postgres:5432/engram
+      ENGRAM_LLM_MODEL: ${ENGRAM_LLM_MODEL:-anthropic/claude-sonnet-4-20250514}
+      ENGRAM_LLM_API_KEY: ${ENGRAM_LLM_API_KEY:-}
+      ENGRAM_EMBEDDING_MODEL: ${ENGRAM_EMBEDDING_MODEL:-text-embedding-3-small}
+      ENGRAM_EMBEDDING_API_KEY: ${ENGRAM_EMBEDDING_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: engram
+      POSTGRES_PASSWORD: engram
+      POSTGRES_DB: engram
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U engram"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
