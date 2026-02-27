@@ -907,4 +907,11 @@ The reconsolidation loop, schema formation, active forgetting (Ebbinghaus decay)
 
 ## License
 
-Apache 2.0
+This project is MIT-licensed.
+
+If you use this in production at a company, I’d love to hear about it:
+please email logos@engram.so (company + use case).
+
+For large-scale deployments (>20,000 external users), we offer paid support
+and an enterprise agreement — contact logos@engram.so.
+

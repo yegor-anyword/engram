@@ -7,7 +7,7 @@ name = "engram"
 version = "0.4.0"
 description = "A brain-inspired, portable context database for AI agents"
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT"
 requires-python = ">=3.11"
 authors = [
     { name = "Softmax Data Inc." },
@@ -16,7 +16,7 @@ keywords = ["ai", "agents", "context", "memory", "llm", "concept-graph"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
