@@ -28,17 +28,25 @@ from engram.server.routes.lifecycle import router as lifecycle_router
 from engram.server.routes.lifecycle import user_router
 from engram.server.routes.materialize import router as materialize_router
 from engram.server.routes.schemas import router as schemas_router
+from engram.storage.base import StorageBackend
 from engram.storage.sqlite import SQLiteBackend
 
 logger = logging.getLogger(__name__)
 
 
-def _create_storage() -> SQLiteBackend:
+def _create_storage() -> StorageBackend:
     settings = get_settings()
-    if settings.storage_backend == "sqlite":
+    if settings.storage_backend == "postgres":
+        from engram.storage.postgres import PostgresBackend
+        if not settings.postgres_dsn:
+            raise ValueError(
+                "ENGRAM_POSTGRES_DSN must be set when storage_backend is 'postgres'"
+            )
+        return PostgresBackend(dsn=settings.postgres_dsn)
+    elif settings.storage_backend == "sqlite":
         return SQLiteBackend(db_path=settings.sqlite_path)
-    # PostgreSQL backend would go here in the future
-    return SQLiteBackend(db_path=settings.sqlite_path)
+    else:
+        raise ValueError(f"Unknown storage backend: {settings.storage_backend}")
 
 
 def _create_llm() -> LiteLLMAdapter:

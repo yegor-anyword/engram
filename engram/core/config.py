@@ -42,7 +42,9 @@ class Settings(BaseSettings):
 
     storage_backend: str = "sqlite"
     sqlite_path: str = "./engram.db"
-    postgres_url: str = "postgresql://engram:engram@localhost:5432/engram"
+
+    # PostgreSQL settings (used when storage_backend = "postgres")
+    postgres_dsn: str = ""
 
     llm_model: str = "anthropic/claude-sonnet-4-20250514"
     llm_api_key: str = ""

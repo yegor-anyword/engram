@@ -6,6 +6,10 @@ Engram stores agent context as atomic knowledge **bullets** in a concept graph �
 
 Inspired by how the human brain stores and retrieves memory — associative recall, schema formation, reconsolidation, active forgetting, and consolidation — and by the [Agentic Context Engineering (ACE)](https://arxiv.org/abs/2510.04618) research on evolving agent playbooks. Every other agent memory product is building a filing cabinet. Engram is building something that learns.
 
+## Why did I bother?
+
+Good question. Because I once worked on a long chat session on GPT5.2, then Claude Opus 4.6 came out, I wanted to use it for further development on the materials but cannot port it over. And I thought to myself, why cannot these contexts become something like Redis or Postgres and LLM is essentially the front UI and logical layer of the context. This came up again when I worked on developing an agentic system where long running context window is a must. Yet, existing reducers wasn't very effective compressing the context. I think thought there must be a better way storing the context than either using full text or summarizing the context. 
+
 ## Why Engram?
 
 Current AI agent frameworks store context as raw text, summaries, or vector chunks. This leads to:
@@ -67,6 +71,27 @@ A **context** is a container for related knowledge — like a project or workspa
 You can have as many contexts as you need. Agents specify which context to read from and write to.
 
 ## Quick Start
+
+### 0. Setting up storage
+
+There are two storage options:
+- SQLite (local) — zero setup, tables auto-created on first run
+- PostgreSQL (local/remote) — requires creating the database first
+
+For PostgreSQL, create the database and enable pgvector before starting the server:
+```sql
+CREATE DATABASE engram;
+\c engram
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+Then set the environment variables:
+```bash
+ENGRAM_STORAGE_BACKEND=postgres
+ENGRAM_POSTGRES_DSN=postgresql://user:password@host:5432/engram
+```
+
+All tables are auto-created on first server start for both backends.
 
 ### 1. Configure the Server
 
