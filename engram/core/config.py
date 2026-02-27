@@ -34,7 +34,7 @@ class IngestionConfig(BaseModel):
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    model_config = {"env_prefix": "ENGRAM_"}
+    model_config = {"env_prefix": "ENGRAM_", "env_file": ".env", "extra": "ignore"}
 
     host: str = "0.0.0.0"
     port: int = 5820

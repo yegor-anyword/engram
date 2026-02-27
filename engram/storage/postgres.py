@@ -49,7 +49,7 @@ def _get_rowcount(status: str) -> int:
 
 class PostgresBackend(StorageBackend):
     """PostgreSQL-based storage for production deployment with pgvector similarity search."""
-
+    
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
         self._pool: asyncpg.Pool | None = None
