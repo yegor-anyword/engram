@@ -28,13 +28,13 @@ Engram solves these with:
 - **Future-proofing with raw input preservation** — every commit stores the original text (like git commits), enabling re-extraction with better models
 
 ## Comparing to different context scaling methods  
-- Method          | Accuracy | Relevance | Tokens Used | Handles Contradictions
-----------------|----------|-----------|-------------|----------------------
-No memory       |   0.2    |    3.0    |      0      |         0.0
-Full stuffing   |   2.8    |    1.5    |   45,000    |         1.2
-Compaction      |   2.1    |    2.2    |    3,000    |         1.0
-RAG             |   2.4    |    2.0    |    4,000    |         0.8
-Engram          |   2.9    |    2.8    |    2,500    |         2.7
+| Method        | Accuracy | Relevance | Tokens Used | Handles Contradictions |
+|--------------|---------:|----------:|------------:|-----------------------:|
+| No memory     |      0.2 |       3.0 |           0 |                    0.0 |
+| Full stuffing |      2.8 |       1.5 |      45,000 |                    1.2 |
+| Compaction    |      2.1 |       2.2 |       3,000 |                    1.0 |
+| RAG           |      2.4 |       2.0 |       4,000 |                    0.8 |
+| Engram        |      2.9 |       2.8 |       2,500 |                    2.7 |
 
 ## How It Works
 
