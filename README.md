@@ -35,25 +35,25 @@ Engram is a **server** that sits between your AI agents and a knowledge graph. Y
 
 There are only two operations that matter: **commit** (write) and **materialize** (read).
 
-![The Core Loop](diagrams/core-loop.png)
+![The Core Loop](https://raw.githubusercontent.com/softmaxdata/engram/main/diagrams/core-loop.png)
 
 ### What's a Bullet?
 
 Instead of storing your agent's output as a blob of text, Engram breaks it into **bullets** — atomic, individually-trackable knowledge units. Each bullet has a type (`fact`, `decision`, `strategy`, `warning`, `procedure`, `exception`, `principle`), a salience score, and usage stats that track how often it's been recalled and whether it helped.
 
-![What's a Bullet?](diagrams/bullet-anatomy.png)
+![What's a Bullet?](https://raw.githubusercontent.com/softmaxdata/engram/main/diagrams/bullet-anatomy.png)
 
 ### What's Reconsolidation?
 
 This is Engram's learning mechanism, borrowed from neuroscience. When you recall memories and then use them, Engram tracks the outcome:
 
-![Reconsolidation Loop](diagrams/reconsolidation.png)
+![Reconsolidation Loop](https://raw.githubusercontent.com/softmaxdata/engram/main/diagrams/reconsolidation.png)
 
 ### What's the Reflector?
 
 Your agents send raw text. They don't extract bullets themselves. The Engram **server** runs a canonical LLM (the "Reflector," configured in `.env`) that processes ALL raw input from ALL agents.
 
-![Canonical Reflector](diagrams/reflector.png)
+![Canonical Reflector](https://raw.githubusercontent.com/softmaxdata/engram/main/diagrams/reflector.png)
 
 ### What's a Context?
 
@@ -148,7 +148,7 @@ ENGRAM_AUTH_ENABLED=false
 **Local (SQLite):**
 
 ```bash
-pip install engram
+pip install engram-contextdb
 engram
 # Server running at http://localhost:5820
 # Using .env for configuration
