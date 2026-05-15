@@ -703,9 +703,13 @@ class IngestionEngine:
         )
         await self.storage.add_activity(context_id, activity)
 
-        # Reconsolidation: if this commit references a materialization, update bullet stats
+        # Reconsolidation: if this commit references a materialization, update
+        # bullet stats via a delta batch (audit-clean, rollback-able).
         if materialization_id and feedback:
-            await self._reconsolidate(materialization_id, feedback)
+            await self._reconsolidate(
+                materialization_id, feedback,
+                agent_id=agent_id, session_id=session_id,
+            )
 
         # v0.3: Emit event
         if self.event_bus is not None:
@@ -853,30 +857,70 @@ class IngestionEngine:
         return decision_id, batch
 
     async def _reconsolidate(
-        self, materialization_id: str, feedback: ExecutionFeedback
-    ) -> None:
-        """Post-recall reconsolidation — update bullet usage stats."""
+        self, materialization_id: str, feedback: ExecutionFeedback,
+        agent_id: str | None = None, session_id: uuid.UUID | None = None,
+    ) -> DeltaBatch | None:
+        """Post-recall reconsolidation, routed through the DeltaEngine.
+
+        Emits one RECONSOLIDATE_BULLET op per bullet in the recall, applied as
+        a single batch so the audit trail / rollback story is consistent with
+        every other mutation. (README claim: "all mutations through deltas.")
+        """
         record = await self.storage.get_materialization(materialization_id)
         if record is None:
             logger.warning("Materialization %s not found for reconsolidation", materialization_id)
-            return
+            return None
 
+        # Decide the per-bullet effect from the outcome once.
+        if feedback.outcome == FeedbackOutcome.SUCCESS:
+            recall_delta, hit_delta, miss_delta, mult = 1, 1, 0, 1.05
+        elif feedback.outcome == FeedbackOutcome.FAILURE:
+            recall_delta, hit_delta, miss_delta, mult = 1, 0, 1, 0.95
+        else:
+            recall_delta, hit_delta, miss_delta, mult = 1, 0, 0, 1.00
+
+        ops: list[DeltaOperation] = []
         for bullet_id in record.bullets_included:
-            bullet = await self.storage.get_bullet(bullet_id)
-            if bullet is None:
-                continue
+            ops.append(DeltaOperation(
+                op_type=DeltaOpType.RECONSOLIDATE_BULLET,
+                target_id=bullet_id,
+                reasoning=(
+                    f"Reconsolidation from materialization {materialization_id} "
+                    f"(outcome={feedback.outcome.value})"
+                ),
+                source=DeltaSource.REFLECTOR,
+                confidence=0.9,
+                agent_id=agent_id,
+                session_id=str(session_id) if session_id else None,
+                # previous_state carries the *input* deltas; DeltaEngine swaps
+                # it for a rollback snapshot after applying.
+                previous_state={
+                    "recall_delta": recall_delta,
+                    "hit_delta": hit_delta,
+                    "miss_delta": miss_delta,
+                    "salience_multiplier": mult,
+                    "outcome": feedback.outcome.value,
+                },
+            ))
+        if not ops:
+            return None
 
-            bullet.recall_count += 1
-            bullet.last_recalled_at = _utcnow()
+        batch = DeltaBatch(
+            context_id=record.context_id,
+            operations=ops,
+            trigger="reconsolidation",
+        )
+        if self.lock_manager is not None:
+            async with self.lock_manager.acquire(record.context_id):
+                batch = await self.delta_engine.apply_batch(batch)
+        else:
+            batch = await self.delta_engine.apply_batch(batch)
 
-            if feedback.outcome == FeedbackOutcome.SUCCESS:
-                bullet.hit_count += 1
-                bullet.salience = min(1.0, bullet.salience * 1.05)
-            elif feedback.outcome == FeedbackOutcome.FAILURE:
-                bullet.miss_count += 1
-                bullet.salience = max(0.05, bullet.salience * 0.95)
-
-            await self.storage.update_bullet(bullet)
+        logger.info(
+            "Reconsolidation: %d bullets updated from materialization %s (outcome=%s)",
+            len(ops), materialization_id, feedback.outcome.value,
+        )
+        return batch
 
         logger.info(
             "Reconsolidation: updated %d bullets from materialization %s (outcome=%s)",
