@@ -4,7 +4,7 @@
 
 Engram stores agent context as atomic knowledge **bullets** in a concept graph — not raw text. Any AI agent can connect to it regardless of which LLM or framework it uses. Context persists across sessions, transfers between models, and gets smarter with every use through reinforcement learning on context quality.
 
-Inspired by how the human brain stores and retrieves memory — associative recall, schema formation, reconsolidation, active forgetting, and consolidation — and by the [Agentic Context Engineering (ACE)](https://arxiv.org/abs/2510.04618) research on evolving agent playbooks. Every other agent memory product is building a filing cabinet. Engram is building something that learns.
+Inspired by how the human brain stores and retrieves memory — associative recall, schema formation, reconsolidation, active forgetting, and consolidation — and by three lines of recent agent-memory research: [Agentic Context Engineering (ACE)](https://arxiv.org/abs/2510.04618), [Dynamic Cheatsheet (DC)](https://arxiv.org/abs/2504.07952), and [Mem-α](https://arxiv.org/abs/2509.25911). Every other agent memory product is building a filing cabinet. Engram is building something that learns.
 
 ## Why bother and why Engram?
 
@@ -19,9 +19,13 @@ Engram solves these with:
 
 - **Agnostic and portable** — We support all LLM: Claude, ChatGPT, Gemini, DeepSeek; all Agentic Frameworks: Langgraph, CrewAI, AG2; and all cloud platforms: AWS, GCP, Azure...
 - **Atomic bullets** — discrete, individually-addressable knowledge units with usage tracking
-- **Delta operations** — mutations are never wholesale rewrites, preventing context collapse
+- **Delta operations** — every mutation (including reconsolidation, core-memory edits) is an atomic delta op, never a wholesale rewrite, preventing context collapse and giving full audit + rollback
 - **Cross-platform** — store once, materialize for any LLM (Claude, GPT, Gemini, local models)
 - **Reinforcement loop** — bullets that prove useful get stronger; unhelpful ones fade away
+- **Core memory slot** — Mem-α-inspired always-in-context running summary (≤512 tokens) per context, rewritten by the Reflector and prepended at every recall so the agent never loses the high-level frame
+- **Worked-example retrieval** — Dynamic-Cheatsheet-inspired: when a recall query is highly similar to a prior raw input, attach that prior input + the bullets it produced as a worked example next to the question
+- **MMR diversity at recall** — Maximal Marginal Relevance ranking stops the token budget from filling with near-duplicate bullets
+- **Optional validity gate** — Mem-α-inspired LM-judge filter at write time, dropping malformed / trivial candidates before they hit the graph
 - **Multi-agent safe** — per-context advisory locks serialize delta application across concurrent agents
 - **Bounded storage** — three-tier lifecycle (active → archived → purged) with capacity management
 - **Canonical extraction** — server-level Reflector model ensures consistent bullets regardless of which agent committed
@@ -39,7 +43,7 @@ There are only two operations that matter: **commit** (write) and **materialize*
 
 ### What's a Bullet?
 
-Instead of storing your agent's output as a blob of text, Engram breaks it into **bullets** — atomic, individually-trackable knowledge units. Each bullet has a type (`fact`, `decision`, `strategy`, `warning`, `procedure`, `exception`, `principle`), a salience score, and usage stats that track how often it's been recalled and whether it helped.
+Instead of storing your agent's output as a blob of text, Engram breaks it into **bullets** — atomic, individually-trackable knowledge units. Each bullet has a type (`fact`, `decision`, `strategy`, `warning`, `procedure`, `exception`, `principle`, `episodic`), a salience score, and usage stats that track how often it's been recalled and whether it helped. `episodic` bullets (Mem-α inspired) are timestamped events — formatted `At {timestamp}, {actor} {did X}` — and are merged with a looser similarity threshold because multiple agents often paraphrase the same event.
 
 ![What's a Bullet?](https://raw.githubusercontent.com/softmaxdata/engram/main/diagrams/bullet-anatomy.png)
 
@@ -60,11 +64,24 @@ Your agents send raw text. They don't extract bullets themselves. The Engram **s
 A **context** is a container for related knowledge — like a project or workspace. Each context has:
 
 - An **intent anchor** (immutable objective that prevents drift)
+- A **core memory** (Mem-α-inspired always-in-context summary, ≤512 tokens, edited by the Reflector and prepended at every recall)
 - A **concept graph** (bullets + edges + schemas)
 - **Capacity limits** (bounded storage with automatic lifecycle management)
-- Its own **activity ledger** (permanent record of every raw input)
+- Its own **activity ledger** (permanent record of every raw input, with embeddings used to retrieve nearest-prior-input worked examples at recall time)
 
 You can have as many contexts as you need. Agents specify which context to read from and write to.
+
+### What gets returned at recall time?
+
+A materialization call assembles, in this order:
+
+1. **Core memory** — the always-in-context summary
+2. **Intent anchor** — objective, success criteria, constraints
+3. **Schemas** — abstract patterns (token-efficient compressions of repeated bullets)
+4. **Bullets** — ranked by relevance × effective_salience × recency, then re-ordered with **MMR** (Maximal Marginal Relevance) so duplicates don't crowd the token budget
+5. **Worked examples** — if the query is highly similar to a prior raw input, the prior input + bullets it produced are attached *last* (closest to the question), with a "verify before copying" caveat — borrowed from Dynamic Cheatsheet
+
+The whole pack is rendered for the target model (Claude XML, GPT Markdown, etc.) and a `materialization_id` receipt is returned so the next commit can close the reconsolidation loop.
 
 ## Quick Start
 
@@ -619,11 +636,14 @@ Engram's architecture maps directly to how human memory works:
 │                    BRAIN ANALOGY                          │
 │                                                          │
 │  Prefrontal Cortex  =  LLM Context Window                │
+│  Working Memory     =  Core Memory slot (always loaded)  │
 │  Hippocampus        =  Ingestion (Reflector + Curator)   │
 │  Neocortex          =  Concept Graph + Schemas           │
 │  Amygdala           =  Salience Scorer                   │
+│  Episodic Memory    =  Episodic Bullets (timestamped)    │
 │  Sleep/Dreams       =  Consolidation Engine              │
 │  Recall             =  Materialization Engine             │
+│  Pattern Completion =  Worked-Example Retrieval          │
 │  Reconsolidation    =  Post-Materialization Feedback     │
 │  Forgetting Curve   =  Salience Decay                    │
 │  Schema Formation   =  Schema Induction                  │
@@ -639,15 +659,20 @@ Engram's architecture maps directly to how human memory works:
 
 ### Key Concepts
 
-- **Bullet** — Atomic unit of knowledge (fact, decision, strategy, warning, etc.) with usage tracking. Bullets that prove useful get stronger over time.
+- **Bullet** — Atomic unit of knowledge (fact, decision, strategy, warning, principle, exception, procedure, episodic) with usage tracking. Bullets that prove useful get stronger over time.
+- **Core Memory** — Mem-α-inspired ≤512-token blob per context, always loaded at recall time. The Reflector decides whether to rewrite it on each commit. Edits are themselves delta ops (`UPDATE_CORE_MEMORY`), so they're auditable and rollback-able.
+- **Worked-Example Retrieval** — Dynamic-Cheatsheet-inspired. At recall time, the activity ledger is searched for the nearest prior raw input by cosine similarity (default ≥ 0.85). Hits are attached as last-position worked examples in the rendered prompt so the consuming LLM sees a precedent next to the question.
+- **MMR Diversity Ranking** — Maximal Marginal Relevance (`λ * relevance − (1 − λ) * max_sim_to_picked`) replaces the greedy-by-score pack so the token budget doesn't fill with near-duplicates. λ is tunable per call.
+- **Validity Gate** *(opt-in)* — Mem-α-inspired batched LM-judge run by the Curator before committing `ADD_BULLET` ops. Rejects empty / trivial / malformed candidates. One extra LLM call per commit; off by default.
+- **Usage Stats in Render** *(opt-in)* — Dynamic-Cheatsheet-inspired. Each bullet's `(used N×, success Y/Z)` is surfaced in the rendered prompt so the consuming LLM can weight proven items.
 - **SchemaNode** — Abstract pattern derived from repeated experiences. Enables efficient context encoding — only deltas from the expected pattern need storage.
-- **DeltaOperation** — Every mutation is an atomic delta op in a DeltaBatch. Context is never regenerated wholesale, preventing context collapse.
+- **DeltaOperation** — Every mutation is an atomic delta op in a DeltaBatch — including bullet add/update/remove/merge, core-memory rewrites, schema changes, and reconsolidation. Context is never regenerated wholesale, preventing context collapse and giving full audit + rollback.
 - **IntentAnchor** — Immutable project objective that prevents context drift across sessions.
-- **Effective Salience** — `salience × (0.5 + hit_rate)` — bullets are ranked by proven usefulness, not just raw importance.
-- **Reconsolidation** — When recalled context leads to success/failure, bullet usage stats update automatically. Context gets smarter with every use.
+- **Effective Salience** — `salience × (0.5 + hit_rate)` once a bullet has been recalled enough times — bullets are ranked by proven usefulness, not just raw importance.
+- **Reconsolidation** — When recalled context leads to success/failure, bullet usage stats update automatically via a `RECONSOLIDATE_BULLET` delta batch. Context gets smarter with every use.
 - **Consolidation** — Background "sleep cycle" that decays unused knowledge, deduplicates, induces schemas, and archives stale bullets.
 - **Canonical Reflector** — Server-level model config ensures ALL agents' raw input is processed by the SAME Reflector model. No cross-model extraction variance.
-- **Raw Input Preservation** — Every commit stores the original text in the activity ledger (like git commits). Bullets can be regenerated from source.
+- **Raw Input Preservation** — Every commit stores the original text in the activity ledger (like git commits), along with its embedding (used by worked-example retrieval). Bullets can be regenerated from source.
 - **Re-Extraction** — Recompile bullets from raw history with a new/better Reflector model. Like upgrading a compiler and recompiling from source.
 
 ### Concurrency Model
@@ -801,7 +826,7 @@ Bullet {
 }
 ```
 
-**Bullet types:** `fact`, `decision`, `strategy`, `warning`, `procedure`, `exception`, `principle`
+**Bullet types:** `fact`, `decision`, `strategy`, `warning`, `procedure`, `exception`, `principle`, `episodic` (timestamped events; merged with a looser similarity threshold and excluded from contradiction detection)
 
 ### SchemaNode (Abstract Pattern)
 
@@ -849,10 +874,12 @@ All settings via environment variables or `.env` file:
 | `ENGRAM_REFLECTOR_PROMPT_VERSION` | `v1` | Reflector prompt iteration |
 | `ENGRAM_MAX_REFLECTION_ROUNDS` | `2` | Self-refinement iterations |
 | **Curator** | | |
-| `ENGRAM_CURATOR_DEDUP_THRESHOLD` | `0.92` | Cosine similarity for merging bullets |
+| `ENGRAM_CURATOR_DEDUP_THRESHOLD` | `0.92` | Cosine similarity for merging bullets (episodic uses a looser 0.85, same-type only) |
 | `ENGRAM_CURATOR_SLOW_PATH_MODEL` | `claude-haiku-4-5` | LLM for complex conflicts |
+| `ENGRAM_ENABLE_VALIDITY_GATE` | `false` | Mem-α-inspired batched LM-judge that drops malformed / trivial `ADD_BULLET` candidates before commit |
+| `ENGRAM_VALIDITY_GATE_MODEL` | `claude-haiku-4-5` | Model used by the validity gate when enabled |
 | **Embedding** | | |
-| `ENGRAM_EMBEDDING_MODEL` | `text-embedding-3-small` | For semantic similarity search |
+| `ENGRAM_EMBEDDING_MODEL` | `text-embedding-3-small` | For bullet similarity search **and** worked-example retrieval over the activity ledger |
 | **Consolidation** | | |
 | `ENGRAM_CONSOLIDATION_TRIGGER` | `every_10_commits` | When to run consolidation |
 | `ENGRAM_FAST_DECAY_RATE` | `0.97` | Per-day salience decay (normal bullets) |
@@ -874,7 +901,7 @@ pytest
 
 ## Acknowledgments & Research
 
-Engram's architecture draws from two primary sources:
+Engram's architecture draws from four primary sources:
 
 ### Agentic Context Engineering (ACE)
 
@@ -891,6 +918,37 @@ Key ACE insights incorporated into Engram:
 - **Split Reflector/Curator pipeline** — separating analysis from storage decisions improves extraction quality
 - **Execution feedback signals** — structured success/failure signals produce better reflections than parsing raw conversation text
 - **Lightweight Curator fast path** — embedding-based dedup handles ~70% of operations without LLM calls
+
+### Dynamic Cheatsheet (DC)
+
+The recall-time retrieval of nearest prior raw inputs as **worked examples**, the optional surfacing of per-bullet usage counters in the rendered prompt, and the explicit "verify before copying" caveat next to retrieved precedents come from Dynamic Cheatsheet:
+
+> **Dynamic Cheatsheet: Test-Time Learning with Adaptive Memory**
+> Mirac Suzgun, Mert Yuksekgonul, Federico Bianchi, Dan Jurafsky, James Zou
+> EACL 2026
+> [arXiv:2504.07952](https://arxiv.org/abs/2504.07952) · [reference code](https://github.com/suzgunmirac/dynamic-cheatsheet)
+
+Key DC insights incorporated into Engram:
+- **Adjacent worked-example injection at recall** — top-k similar prior (input, output) pairs placed last in the rendered context (closest to the question) materially helps generators on code/math-style tasks (the `<worked_examples>` block in Engram)
+- **Per-item usage counts surfaced in the prompt** — `(used N×, success Y/Z)` lets the consuming LLM weight proven items
+- **Bounded recall blob with "verify, don't copy" framing** — retrieved precedents are semantically close, not necessarily correct
+
+Engram deliberately does **not** adopt DC's wholesale-rewrite update policy or its LLM-incremented usage counters without outcome signal — both are weaknesses DC inherits from lacking structured storage. Engram's delta ops + reconsolidation tied to a real outcome strictly dominate that pattern.
+
+### Mem-α: Learning Memory Construction via Reinforcement Learning
+
+The **core-memory slot**, the **episodic / semantic memory distinction**, and the optional **content-validity gate** at write time come from Mem-α:
+
+> **Mem-α: Learning Memory Construction via Reinforcement Learning**
+> Yu Wang, Wen Wang, Ricardo Henao, Lawrence Carin et al.
+> [arXiv:2509.25911](https://arxiv.org/abs/2509.25911) · [reference code](https://github.com/wangyu-ustc/Mem-alpha)
+
+Key Mem-α insights incorporated into Engram:
+- **Core Memory as an always-in-context slot** — Mem-α's strongest architectural lesson is that an explicit, bounded running summary survives compaction even when retrieval misses. Engram implements this as a ≤512-token blob per context, rewritten by the Reflector and prepended at every recall.
+- **Episodic vs semantic memory split** — episodic bullets are timestamped events formatted `At {timestamp}, {actor} {did X}`, merged with a looser threshold (paraphrased event reports are common across agents), and exempted from contradiction detection (events don't contradict — both can be true at different timestamps).
+- **Content-validity signal at write time** — Mem-α's γ-reward (an LLM-judge over each candidate write) was indispensable in their ablation. Engram exposes this as an opt-in `enable_validity_gate` in the Curator, batched into a single LLM call per commit.
+
+Because Engram is a runtime/server (not a training framework), it does **not** implement Mem-α's RL training loop. The mechanisms above are the training-free distillation of what the learned policy converges to.
 
 ### Cognitive Neuroscience
 
