@@ -112,6 +112,8 @@ class DeltaOpType(str, enum.Enum):
     REMOVE_EDGE = "remove_edge"
     ADD_SCHEMA = "add_schema"
     UPDATE_SCHEMA = "update_schema"
+    UPDATE_CORE_MEMORY = "update_core_memory"
+    RECONSOLIDATE_BULLET = "reconsolidate_bullet"
 
 
 class DeltaSource(str, enum.Enum):
@@ -326,6 +328,11 @@ class Reflection(BaseModel):
     rounds_completed: int = 1
     confidence: float = 0.5
     raw_input_type: str = "conversation"
+
+    # Mem-α inspired: optional rewrite of the always-in-context core memory blob.
+    # None means "leave unchanged". A non-None value REPLACES core_memory wholesale,
+    # so the Reflector is instructed to preserve information it wants to keep.
+    core_memory_update: str | None = None
 
 
 # ── Materialization Tracking ──────────────────────────────────────────────
@@ -544,6 +551,9 @@ class Activity(BaseModel):
 # ── Context (Top-Level Container) ─────────────────────────────────────────
 
 
+CORE_MEMORY_MAX_TOKENS = 512  # Mem-α: bounded always-in-context summary slot.
+
+
 class Context(BaseModel):
     """Top-level container holding an intent anchor, concept graph, and activity ledger."""
 
@@ -556,6 +566,10 @@ class Context(BaseModel):
     version: int = 1
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+
+    # v0.5: Mem-α inspired core memory — running summary always included in materialization,
+    # rewritten by the Reflector (full-replace) and capped at CORE_MEMORY_MAX_TOKENS.
+    core_memory: str = ""
 
     # v0.3 lifecycle configuration
     lifecycle_config: LifecycleConfig = Field(default_factory=LifecycleConfig)

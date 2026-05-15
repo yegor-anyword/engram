@@ -57,6 +57,12 @@ class StorageBackend(abc.ABC):
     async def delete_context(self, context_id: uuid.UUID) -> None:
         """Hard-delete a context and all associated data."""
 
+    @abc.abstractmethod
+    async def update_core_memory(
+        self, context_id: str, core_memory: str
+    ) -> None:
+        """Replace the always-in-context core memory blob for a context."""
+
     # ── Intent ─────────────────────────────────────────────────────────
 
     @abc.abstractmethod

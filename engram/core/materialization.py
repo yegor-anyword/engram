@@ -86,10 +86,12 @@ class MaterializationEngine:
         """
         ctx_id_str = str(context_id)
 
-        # 1. Load intent
+        # 1. Load intent + core memory (Mem-α: always-in-context summary)
         intent: IntentAnchor | None = None
         if include_intent:
             intent = await self.storage.get_intent(context_id)
+        context_obj = await self.storage.get_context(context_id)
+        core_memory = context_obj.core_memory if context_obj else ""
 
         # 2. Load bullets (primary v0.2 storage)
         all_bullets = await self.storage.list_bullets(ctx_id_str)
@@ -118,6 +120,7 @@ class MaterializationEngine:
                 ctx_id_str, context_id, all_bullets, schemas, intent,
                 query or task or "", focus_domains or [], recency_weight,
                 include_decisions, token_budget, target_model, renderer,
+                core_memory=core_memory,
             )
         elif all_concepts:
             # Fallback to legacy concept-based materialization
@@ -125,9 +128,10 @@ class MaterializationEngine:
                 context_id, all_concepts, intent, query or task or "",
                 focus_domains or [], recency_weight, include_decisions,
                 token_budget, target_model, renderer,
+                core_memory=core_memory,
             )
         else:
-            text = renderer.render([], intent, token_budget)
+            text = renderer.render([], intent, token_budget, core_memory=core_memory)
             result = {
                 "materialization_id": str(uuid.uuid4()),
                 "rendered_text": text,
@@ -181,6 +185,7 @@ class MaterializationEngine:
         focus_domains: list[str], recency_weight: float,
         include_decisions: bool, token_budget: int,
         target_model: str, renderer: ContextRenderer,
+        core_memory: str = "",
     ) -> dict[str, Any]:
         """Bullet-based materialization with effective salience ranking."""
         mat_id = str(uuid.uuid4())
@@ -201,8 +206,8 @@ class MaterializationEngine:
         total_tokens = 0
 
         intent_budget = 0
-        if intent:
-            intent_text = renderer.render([], intent, token_budget)
+        if intent or core_memory:
+            intent_text = renderer.render([], intent, token_budget, core_memory=core_memory)
             intent_budget = renderer.estimate_tokens(intent_text)
 
         remaining = token_budget - intent_budget
@@ -239,7 +244,9 @@ class MaterializationEngine:
             selected_bullet_ids.append(bullet.id)
             total_tokens += est
 
-        rendered = renderer.render(selected_concepts, intent, token_budget)
+        rendered = renderer.render(
+            selected_concepts, intent, token_budget, core_memory=core_memory,
+        )
         actual_tokens = renderer.estimate_tokens(rendered)
         coverage = len(selected_bullet_ids) / len(bullets) if bullets else 0.0
 
@@ -259,6 +266,7 @@ class MaterializationEngine:
         focus_domains: list[str], recency_weight: float,
         include_decisions: bool, token_budget: int,
         target_model: str, renderer: ContextRenderer,
+        core_memory: str = "",
     ) -> dict[str, Any]:
         """Legacy concept-based materialization."""
         mat_id = str(uuid.uuid4())
@@ -275,8 +283,8 @@ class MaterializationEngine:
         total_tokens = 0
 
         intent_budget = 0
-        if intent:
-            intent_text = renderer.render([], intent, token_budget)
+        if intent or core_memory:
+            intent_text = renderer.render([], intent, token_budget, core_memory=core_memory)
             intent_budget = renderer.estimate_tokens(intent_text)
         remaining = token_budget - intent_budget
 
@@ -290,7 +298,7 @@ class MaterializationEngine:
             selected.append(concept)
             total_tokens += est
 
-        rendered = renderer.render(selected, intent, token_budget)
+        rendered = renderer.render(selected, intent, token_budget, core_memory=core_memory)
         actual_tokens = renderer.estimate_tokens(rendered)
         coverage = len(selected) / len(concepts) if concepts else 0.0
 

@@ -86,7 +86,8 @@ class PostgresBackend(StorageBackend):
                         version INTEGER DEFAULT 1,
                         created_at TIMESTAMPTZ NOT NULL,
                         updated_at TIMESTAMPTZ NOT NULL,
-                        lifecycle_config TEXT DEFAULT '{}'
+                        lifecycle_config TEXT DEFAULT '{}',
+                        core_memory TEXT DEFAULT ''
                     )
                 """)
 
@@ -300,6 +301,7 @@ class PostgresBackend(StorageBackend):
         # Schema migrations for existing databases
         await self._migrate_v03(pool)
         await self._migrate_v04(pool)
+        await self._migrate_v05(pool)
 
         safe_dsn = self.dsn.split("@")[-1] if "@" in self.dsn else self.dsn
         logger.info("PostgreSQL storage initialized at %s", safe_dsn)
@@ -365,6 +367,19 @@ class PostgresBackend(StorageBackend):
             "ON activities(context_id, raw_input_hash)"
         )
 
+    async def _migrate_v05(self, pool: asyncpg.Pool) -> None:
+        """v0.5: Mem-α core_memory on contexts, DC activity embedding column."""
+        if not await self._column_exists(pool, "contexts", "core_memory"):
+            await pool.execute(
+                "ALTER TABLE contexts ADD COLUMN core_memory TEXT DEFAULT ''"
+            )
+            logger.info("Added core_memory column to contexts")
+        if not await self._column_exists(pool, "activities", "raw_input_embedding"):
+            await pool.execute(
+                "ALTER TABLE activities ADD COLUMN raw_input_embedding TEXT"
+            )
+            logger.info("Added raw_input_embedding column to activities")
+
     async def close(self) -> None:
         if self._pool is not None:
             await self._pool.close()
@@ -378,10 +393,11 @@ class PostgresBackend(StorageBackend):
         lifecycle_json = context.lifecycle_config.model_dump_json()
         await pool.execute(
             "INSERT INTO contexts (id, name, description, owner, version, "
-            "created_at, updated_at, lifecycle_config) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "created_at, updated_at, lifecycle_config, core_memory) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             str(context.id), context.name, context.description, context.owner,
             context.version, context.created_at, now, lifecycle_json,
+            context.core_memory,
         )
         intent = context.intent
         intent.context_id = context.id
@@ -408,12 +424,14 @@ class PostgresBackend(StorageBackend):
             return None
         lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
         lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+        core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
         return Context(
             id=uuid.UUID(row["id"]), name=row["name"], description=row["description"],
             owner=row["owner"], intent=intent, version=row["version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             lifecycle_config=lifecycle_config,
+            core_memory=core_memory or "",
         )
 
     async def list_contexts(
@@ -444,12 +462,14 @@ class PostgresBackend(StorageBackend):
             if intent is not None:
                 lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
                 lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+                core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
                 contexts.append(Context(
                     id=ctx_id, name=row["name"], description=row["description"],
                     owner=row["owner"], intent=intent, version=row["version"],
                     created_at=row["created_at"],
                     updated_at=row["updated_at"],
                     lifecycle_config=lifecycle_config,
+                    core_memory=core_memory or "",
                 ))
         return contexts
 
@@ -465,6 +485,15 @@ class PostgresBackend(StorageBackend):
         )
         context.updated_at = now
         return context
+
+    async def update_core_memory(
+        self, context_id: str, core_memory: str
+    ) -> None:
+        pool = await self._get_pool()
+        await pool.execute(
+            "UPDATE contexts SET core_memory = $1, updated_at = $2 WHERE id = $3",
+            core_memory, _utcnow(), context_id,
+        )
 
     async def delete_context(self, context_id: uuid.UUID) -> None:
         pool = await self._get_pool()

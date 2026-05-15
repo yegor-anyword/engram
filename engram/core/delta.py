@@ -77,6 +77,12 @@ class DeltaEngine:
                 case DeltaOpType.UPDATE_SCHEMA:
                     await self._apply_update_schema(op)
 
+                case DeltaOpType.UPDATE_CORE_MEMORY:
+                    await self._apply_update_core_memory(batch.context_id, op)
+
+                case DeltaOpType.RECONSOLIDATE_BULLET:
+                    await self._apply_reconsolidate_bullet(op)
+
                 case _:
                     logger.warning("Unknown delta op type: %s", op.op_type)
 
@@ -125,6 +131,25 @@ class DeltaEngine:
                         bullet = await self.storage.get_bullet(op.target_id)
                         if bullet:
                             bullet.is_active = True
+                            await self.storage.update_bullet(bullet)
+
+                case DeltaOpType.UPDATE_CORE_MEMORY:
+                    prev_core = op.previous_state.get("core_memory", "")
+                    await self.storage.update_core_memory(batch.context_id, prev_core)
+
+                case DeltaOpType.RECONSOLIDATE_BULLET:
+                    if op.target_id:
+                        bullet = await self.storage.get_bullet(op.target_id)
+                        if bullet:
+                            prev = op.previous_state
+                            bullet.recall_count = int(prev.get("recall_count", bullet.recall_count))
+                            bullet.hit_count = int(prev.get("hit_count", bullet.hit_count))
+                            bullet.miss_count = int(prev.get("miss_count", bullet.miss_count))
+                            bullet.salience = float(prev.get("salience", bullet.salience))
+                            lr = prev.get("last_recalled_at")
+                            bullet.last_recalled_at = (
+                                datetime.fromisoformat(lr) if isinstance(lr, str) else None
+                            )
                             await self.storage.update_bullet(bullet)
 
         return True
@@ -227,3 +252,54 @@ class DeltaEngine:
         if schema and op.content:
             schema.description = op.content
             await self.storage.update_schema(schema)
+
+    async def _apply_update_core_memory(
+        self, context_id: str, op: DeltaOperation,
+    ) -> None:
+        """Replace the always-in-context core memory blob.
+
+        The new value is in op.content; capture the previous value into
+        previous_state so rollback restores it.
+        """
+        if op.content is None:
+            return
+        try:
+            ctx = await self.storage.get_context(uuid.UUID(context_id))
+        except (ValueError, AttributeError):
+            ctx = None
+        if ctx is not None:
+            op.previous_state = {"core_memory": ctx.core_memory}
+        await self.storage.update_core_memory(context_id, op.content)
+
+    async def _apply_reconsolidate_bullet(self, op: DeltaOperation) -> None:
+        """Audit-clean reconsolidation: update a bullet's usage stats and salience.
+
+        op.previous_state — set by caller — carries the deltas to apply:
+          {"recall_delta": int, "hit_delta": int, "miss_delta": int,
+           "salience_multiplier": float, "outcome": "success|failure|partial"}
+        We snapshot the prior values into a fresh previous_state for rollback
+        and apply the changes.
+        """
+        if not op.target_id or op.previous_state is None:
+            return
+        bullet = await self.storage.get_bullet(op.target_id)
+        if bullet is None:
+            return
+        deltas = op.previous_state
+        prior = {
+            "recall_count": bullet.recall_count,
+            "hit_count": bullet.hit_count,
+            "miss_count": bullet.miss_count,
+            "salience": bullet.salience,
+            "last_recalled_at": bullet.last_recalled_at.isoformat()
+                if bullet.last_recalled_at else None,
+        }
+        bullet.recall_count += int(deltas.get("recall_delta", 0))
+        bullet.hit_count += int(deltas.get("hit_delta", 0))
+        bullet.miss_count += int(deltas.get("miss_delta", 0))
+        mult = float(deltas.get("salience_multiplier", 1.0))
+        bullet.salience = max(0.05, min(1.0, bullet.salience * mult))
+        bullet.last_recalled_at = _utcnow()
+        await self.storage.update_bullet(bullet)
+        # Replace the input deltas with a rollback snapshot now that we've applied.
+        op.previous_state = prior

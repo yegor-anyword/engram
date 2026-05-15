@@ -23,6 +23,7 @@ from engram.core.delta import DeltaEngine
 from engram.core.events import EventBus
 from engram.core.exceptions import CapacityExceededError, IngestionError
 from engram.core.models import (
+    CORE_MEMORY_MAX_TOKENS,
     ActionType,
     Activity,
     Bullet,
@@ -48,6 +49,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _cap_core_memory(text: str, max_tokens: int = CORE_MEMORY_MAX_TOKENS) -> str:
+    """Truncate core memory text to a token budget. Uses tiktoken when available,
+    otherwise falls back to ~4 chars/token. Truncation is on token boundaries so
+    we never emit a half-decoded codepoint."""
+    if not text:
+        return ""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        toks = enc.encode(text)
+        if len(toks) <= max_tokens:
+            return text
+        return enc.decode(toks[:max_tokens])
+    except Exception:
+        char_budget = max_tokens * 4
+        return text if len(text) <= char_budget else text[:char_budget]
+
+
 # ── Reflector ──────────────────────────────────────────────────────────────
 
 
@@ -69,6 +88,14 @@ For each insight:
 - Suggest a section grouping
 - Rate novelty (0-1, how new vs existing context)
 
+You will also see the current CORE MEMORY — a short, always-in-context running
+summary of who, what, and where this context is. If — and only if — there is a
+meaningful update to make (new stable facts about the user/task, a resolved
+ambiguity, a status change), emit `core_memory_update` containing the FULL new
+core memory text. The new value REPLACES the old wholesale, so explicitly carry
+forward anything still relevant. Keep it under ~400 words. Leave it null when no
+change is warranted (the common case).
+
 Respond ONLY with valid JSON:
 {
   "new_insights": [
@@ -79,6 +106,7 @@ Respond ONLY with valid JSON:
   "failure_modes": ["..."],
   "prediction_errors": ["..."],
   "open_questions": ["..."],
+  "core_memory_update": null,
   "confidence": 0.8
 }"""
 
@@ -105,6 +133,7 @@ class ReflectorEngine:
         raw_input: str,
         feedback: ExecutionFeedback | None = None,
         existing_context_summary: str | None = None,
+        existing_core_memory: str | None = None,
         max_rounds: int | None = None,
         model_override: str | None = None,
     ) -> Reflection:
@@ -129,7 +158,17 @@ class ReflectorEngine:
         if existing_context_summary:
             context_text = f"\n\nExisting context summary:\n{existing_context_summary}"
 
-        prompt = f"Analyze this input and extract insights:{context_text}{feedback_text}\n\nRaw input:\n{raw_input}"
+        core_text = ""
+        if existing_core_memory is not None:
+            core_text = (
+                f"\n\nCurrent core memory (running always-in-context summary):\n"
+                f"{existing_core_memory or '(empty)'}"
+            )
+
+        prompt = (
+            f"Analyze this input and extract insights:"
+            f"{context_text}{core_text}{feedback_text}\n\nRaw input:\n{raw_input}"
+        )
 
         raw_response = await self.llm.complete(
             prompt=prompt,
@@ -159,6 +198,10 @@ class ReflectorEngine:
             for ins in data.get("new_insights", [])
         ]
 
+        core_memory_update = data.get("core_memory_update")
+        if isinstance(core_memory_update, str) and not core_memory_update.strip():
+            core_memory_update = None
+
         return Reflection(
             new_insights=insights,
             strategies_that_worked=data.get("strategies_that_worked", []),
@@ -168,6 +211,7 @@ class ReflectorEngine:
             rounds_completed=1,
             confidence=data.get("confidence", 0.5),
             raw_input_type="conversation",
+            core_memory_update=core_memory_update if isinstance(core_memory_update, str) else None,
         )
 
 
@@ -554,15 +598,18 @@ class IngestionEngine:
                 )
                 return existing_batch
 
-        # Build context summary for the Reflector
+        # Build context summary + load core memory for the Reflector
         existing_bullets = await self.storage.list_bullets(ctx_id_str)
         summary = self._summarize_bullets(existing_bullets) if existing_bullets else None
+        existing_context = await self.storage.get_context(context_id)
+        existing_core_memory = existing_context.core_memory if existing_context else ""
 
         # Phase 1: Reflect (using CANONICAL model from config)
         reflection = await self.reflector.reflect(
             raw_input=content,
             feedback=feedback,
             existing_context_summary=summary,
+            existing_core_memory=existing_core_memory,
         )
 
         # Phase 2: Curate
@@ -572,6 +619,22 @@ class IngestionEngine:
             agent_id=agent_id,
             session_id=str(session_id) if session_id else None,
         )
+
+        # Phase 2.5: Append a core memory update op if the Reflector proposed one.
+        # Going through DeltaEngine keeps the change auditable + rollback-able.
+        if reflection.core_memory_update is not None:
+            new_core = _cap_core_memory(reflection.core_memory_update)
+            if new_core != existing_core_memory:
+                batch.operations.append(DeltaOperation(
+                    op_type=DeltaOpType.UPDATE_CORE_MEMORY,
+                    target_id=ctx_id_str,
+                    content=new_core,
+                    reasoning="Reflector emitted a core memory update.",
+                    source=DeltaSource.REFLECTOR,
+                    confidence=reflection.confidence,
+                    agent_id=agent_id,
+                    session_id=str(session_id) if session_id else None,
+                ))
 
         # v0.3: Capacity check before applying deltas
         net_adds = sum(

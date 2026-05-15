@@ -14,8 +14,16 @@ class GPTRenderer(ContextRenderer):
         concepts: list[ConceptNode],
         intent: IntentAnchor | None,
         token_budget: int,
+        core_memory: str = "",
+        worked_examples: list[dict] | None = None,
+        usage_stats: dict[str, str] | None = None,
     ) -> str:
         sections: list[str] = []
+
+        if core_memory:
+            sections.append("## Core Memory\n")
+            sections.append(core_memory)
+            sections.append("")
 
         if intent:
             sections.append("# Project Context")
@@ -62,6 +70,22 @@ class GPTRenderer(ContextRenderer):
             block_tokens = self.estimate_tokens(block)
             if current_tokens + block_tokens <= token_budget:
                 sections.append(block)
+
+        if worked_examples:
+            sections.append("\n## Worked Examples\n")
+            sections.append(
+                "_Nearest prior inputs from this context. Verify before copying — "
+                "they're retrieved by semantic similarity._\n"
+            )
+            for i, ex in enumerate(worked_examples, 1):
+                inp = (ex.get("input") or "").strip()
+                out = (ex.get("output") or "").strip()
+                sections.append(f"### Example {i}")
+                if inp:
+                    sections.append(f"**Input:** {inp}")
+                if out:
+                    sections.append(f"**Bullets produced:** {out}")
+                sections.append("")
 
         return "\n".join(sections)
 

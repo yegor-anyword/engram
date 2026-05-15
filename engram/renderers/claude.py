@@ -14,8 +14,16 @@ class ClaudeRenderer(ContextRenderer):
         concepts: list[ConceptNode],
         intent: IntentAnchor | None,
         token_budget: int,
+        core_memory: str = "",
+        worked_examples: list[dict] | None = None,
+        usage_stats: dict[str, str] | None = None,
     ) -> str:
         sections: list[str] = ["<context>"]
+
+        if core_memory:
+            sections.append("  <core_memory>")
+            sections.append(f"    {core_memory}")
+            sections.append("  </core_memory>")
 
         if intent:
             sections.append("  <intent>")
@@ -83,6 +91,23 @@ class ClaudeRenderer(ContextRenderer):
                 break
             sections.append(block)
             current_tokens += block_tokens
+
+        if worked_examples:
+            sections.append("  <worked_examples>")
+            sections.append(
+                "    <!-- Nearest prior inputs from this context. Verify before "
+                "copying; they're retrieved by semantic similarity. -->"
+            )
+            for i, ex in enumerate(worked_examples, 1):
+                sections.append(f"    <example index=\"{i}\">")
+                inp = (ex.get("input") or "").strip()
+                out = (ex.get("output") or "").strip()
+                if inp:
+                    sections.append(f"      <input>{inp}</input>")
+                if out:
+                    sections.append(f"      <bullets_produced>{out}</bullets_produced>")
+                sections.append("    </example>")
+            sections.append("  </worked_examples>")
 
         sections.append("</context>")
         return "\n".join(sections)

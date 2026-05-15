@@ -74,7 +74,8 @@ class SQLiteBackend(StorageBackend):
                 owner TEXT DEFAULT 'default',
                 version INTEGER DEFAULT 1,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                core_memory TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS intents (
@@ -229,6 +230,9 @@ class SQLiteBackend(StorageBackend):
         # v0.4 schema migration: add raw input columns to activities
         await self._migrate_v04(db)
 
+        # v0.5 schema migration: Mem-α core memory + DC worked-example activity embeddings
+        await self._migrate_v05(db)
+
         await db.commit()
         logger.info("SQLite storage initialized at %s", self.db_path)
 
@@ -296,6 +300,24 @@ class SQLiteBackend(StorageBackend):
             "ON activities(context_id, raw_input_hash)"
         )
 
+    async def _migrate_v05(self, db: aiosqlite.Connection) -> None:
+        """Add v0.5 columns: core_memory on contexts, raw_input_embedding on activities."""
+        cursor = await db.execute("PRAGMA table_info(contexts)")
+        ctx_cols = {row[1] for row in await cursor.fetchall()}
+        if "core_memory" not in ctx_cols:
+            await db.execute(
+                "ALTER TABLE contexts ADD COLUMN core_memory TEXT DEFAULT ''"
+            )
+            logger.info("Added core_memory column to contexts")
+
+        cursor = await db.execute("PRAGMA table_info(activities)")
+        act_cols = {row[1] for row in await cursor.fetchall()}
+        if "raw_input_embedding" not in act_cols:
+            await db.execute(
+                "ALTER TABLE activities ADD COLUMN raw_input_embedding TEXT"
+            )
+            logger.info("Added raw_input_embedding column to activities")
+
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
@@ -308,10 +330,12 @@ class SQLiteBackend(StorageBackend):
         now = _utcnow().isoformat()
         lifecycle_json = context.lifecycle_config.model_dump_json()
         await db.execute(
-            "INSERT INTO contexts (id, name, description, owner, version, created_at, updated_at, lifecycle_config) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO contexts (id, name, description, owner, version, created_at, updated_at, "
+            "lifecycle_config, core_memory) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(context.id), context.name, context.description, context.owner,
-             context.version, context.created_at.isoformat(), now, lifecycle_json),
+             context.version, context.created_at.isoformat(), now, lifecycle_json,
+             context.core_memory),
         )
         intent = context.intent
         intent.context_id = context.id
@@ -337,12 +361,14 @@ class SQLiteBackend(StorageBackend):
             return None
         lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
         lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+        core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
         return Context(
             id=uuid.UUID(row["id"]), name=row["name"], description=row["description"],
             owner=row["owner"], intent=intent, version=row["version"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             lifecycle_config=lifecycle_config,
+            core_memory=core_memory or "",
         )
 
     async def list_contexts(
@@ -371,12 +397,14 @@ class SQLiteBackend(StorageBackend):
             if intent is not None:
                 lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
                 lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+                core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
                 contexts.append(Context(
                     id=ctx_id, name=row["name"], description=row["description"],
                     owner=row["owner"], intent=intent, version=row["version"],
                     created_at=datetime.fromisoformat(row["created_at"]),
                     updated_at=datetime.fromisoformat(row["updated_at"]),
                     lifecycle_config=lifecycle_config,
+                    core_memory=core_memory or "",
                 ))
         return contexts
 
@@ -397,6 +425,16 @@ class SQLiteBackend(StorageBackend):
     async def delete_context(self, context_id: uuid.UUID) -> None:
         db = await self._get_db()
         await db.execute("DELETE FROM contexts WHERE id = ?", (str(context_id),))
+
+    async def update_core_memory(
+        self, context_id: str, core_memory: str
+    ) -> None:
+        db = await self._get_db()
+        await db.execute(
+            "UPDATE contexts SET core_memory = ?, updated_at = ? WHERE id = ?",
+            (core_memory, _utcnow().isoformat(), context_id),
+        )
+        await db.commit()
         await db.commit()
 
     # ── Intent ─────────────────────────────────────────────────────────
