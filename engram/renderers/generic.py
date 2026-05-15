@@ -37,7 +37,11 @@ class GenericRenderer(ContextRenderer):
         current_tokens = self.estimate_tokens("\n".join(sections))
 
         for concept in concepts:
-            line = f"[{concept.type.value.upper()}] {concept.content}"
+            usage = (
+                f" {usage_stats[concept.content]}"
+                if usage_stats and concept.content in usage_stats else ""
+            )
+            line = f"[{concept.type.value.upper()}] {concept.content}{usage}"
             line_tokens = self.estimate_tokens(line)
             if current_tokens + line_tokens > token_budget:
                 break

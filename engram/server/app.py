@@ -78,6 +78,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_reflection_rounds=settings.max_reflection_rounds,
         curator_dedup_threshold=settings.curator_dedup_threshold,
         curator_slow_path_model=settings.curator_slow_path_model,
+        enable_validity_gate=settings.enable_validity_gate,
+        validity_gate_model=settings.validity_gate_model,
         embedding_model=settings.embedding_model,
     )
 

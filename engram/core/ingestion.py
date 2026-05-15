@@ -218,6 +218,22 @@ class ReflectorEngine:
 # ── Curator ────────────────────────────────────────────────────────────────
 
 
+VALIDITY_GATE_SYSTEM_PROMPT = """\
+You are the Validity Gate in a memory ingestion pipeline. Each proposed write
+is a short bullet that will become a long-lived memory item. Your job is to
+reject writes that are NOT worth storing:
+- empty / whitespace only / placeholder
+- trivially restates the input or a tautology
+- malformed (truncated mid-sentence, garbled, not a complete idea)
+- pure conversational filler ("ok", "sounds good", "thanks")
+Keep writes that are concrete, non-trivial knowledge — facts, decisions,
+strategies, warnings, procedures, exceptions, principles.
+
+Return ONLY valid JSON of the form:
+{"verdicts": [{"idx": 0, "keep": true}, {"idx": 1, "keep": false, "reason": "..."}, ...]}
+"""
+
+
 class CuratorEngine:
     """Phase 2: Decide what delta operations to apply.
 
@@ -228,9 +244,15 @@ class CuratorEngine:
     (embedding dedup, deterministic merge). Only complex conflicts need LLM.
     """
 
-    def __init__(self, storage: StorageBackend, llm: LLMAdapter) -> None:
+    def __init__(
+        self,
+        storage: StorageBackend,
+        llm: LLMAdapter,
+        ingestion_config: IngestionConfig | None = None,
+    ) -> None:
         self.storage = storage
         self.llm = llm
+        self.ingestion_config = ingestion_config or IngestionConfig()
 
     async def curate(
         self,
@@ -295,12 +317,86 @@ class CuratorEngine:
                 session_id=session_id,
             ))
 
+        # Mem-α-inspired validity gate: drop malformed/trivial ADD_BULLET ops
+        # via a single batched LLM judge call. Opt-in to avoid the extra cost.
+        if self.ingestion_config.enable_validity_gate and operations:
+            operations = await self._filter_invalid_ops(operations)
+
         batch = DeltaBatch(
             context_id=context_id,
             operations=operations,
             trigger="commit",
         )
         return batch
+
+    async def _filter_invalid_ops(
+        self, ops: list[DeltaOperation],
+    ) -> list[DeltaOperation]:
+        """Run a batched LLM judge over all ADD_BULLET ops; drop the ones it
+        rejects. Non-ADD ops pass through untouched. Errors fall back to
+        keeping everything (fail-open — we'd rather store too much than too
+        little when the judge is unavailable)."""
+        add_ops_with_idx = [
+            (i, op) for i, op in enumerate(ops)
+            if op.op_type == DeltaOpType.ADD_BULLET and op.content
+        ]
+        if not add_ops_with_idx:
+            return ops
+
+        # Build a numbered list for the judge.
+        candidate_text = "\n".join(
+            f"[{i}] {op.content}" for i, (_, op) in enumerate(add_ops_with_idx)
+        )
+        prompt = (
+            "Evaluate each candidate memory write below. Reject any that are "
+            "empty, malformed, trivial, conversational filler, or otherwise "
+            "not worth storing as a long-lived memory item.\n\n"
+            f"Candidates:\n{candidate_text}\n\n"
+            "Return JSON with verdicts for each candidate by its bracketed index."
+        )
+
+        # Allow temporary model override via ingestion_config.
+        gate_model = self.ingestion_config.validity_gate_model
+        try:
+            raw = await self.llm.complete(
+                prompt=prompt,
+                system=VALIDITY_GATE_SYSTEM_PROMPT,
+                temperature=0.0,
+                response_format="json",
+            )
+            data = json.loads(raw) if not isinstance(raw, dict) else raw
+            verdicts = data.get("verdicts", [])
+        except Exception as exc:
+            logger.warning(
+                "Validity gate (%s) failed, passing all ops through: %s",
+                gate_model, exc,
+            )
+            return ops
+
+        # Map judge indices back to op positions.
+        rejected_judge_indices: set[int] = set()
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            try:
+                jidx = int(v.get("idx", -1))
+            except (TypeError, ValueError):
+                continue
+            if v.get("keep") is False and 0 <= jidx < len(add_ops_with_idx):
+                rejected_judge_indices.add(jidx)
+                logger.debug(
+                    "Validity gate rejected: %s (reason: %s)",
+                    add_ops_with_idx[jidx][1].content[:80],
+                    v.get("reason", "unspecified"),
+                )
+
+        if not rejected_judge_indices:
+            return ops
+
+        rejected_op_positions = {
+            add_ops_with_idx[j][0] for j in rejected_judge_indices
+        }
+        return [op for i, op in enumerate(ops) if i not in rejected_op_positions]
 
     async def _process_insight(
         self,
@@ -560,7 +656,7 @@ class IngestionEngine:
         self.event_bus = event_bus
         self.ingestion_config = ingestion_config or IngestionConfig()
         self.reflector = ReflectorEngine(llm, config=self.ingestion_config)
-        self.curator = CuratorEngine(storage, llm)
+        self.curator = CuratorEngine(storage, llm, ingestion_config=self.ingestion_config)
         self.delta_engine = DeltaEngine(storage)
 
     async def commit(

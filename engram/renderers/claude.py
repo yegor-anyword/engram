@@ -77,7 +77,7 @@ class ClaudeRenderer(ContextRenderer):
         ]:
             if not section_concepts:
                 continue
-            block = self._render_section(section_name, section_concepts)
+            block = self._render_section(section_name, section_concepts, usage_stats)
             block_tokens = self.estimate_tokens(block)
             if current_tokens + block_tokens > token_budget:
                 # Trim section to fit budget
@@ -117,13 +117,15 @@ class ClaudeRenderer(ContextRenderer):
         return len(text) // 4 + 1
 
     def _render_section(
-        self, name: str, concepts: list[ConceptNode]
+        self, name: str, concepts: list[ConceptNode],
+        usage_stats: dict[str, str] | None = None,
     ) -> str:
         lines = [f"  <{name}>"]
         for c in concepts:
             confidence = f' confidence="{c.confidence:.1f}"' if c.confidence < 1.0 else ""
             tags = f' tags="{",".join(c.domain_tags)}"' if c.domain_tags else ""
-            lines.append(f"    <concept{confidence}{tags}>{c.content}</concept>")
+            suffix = f" {usage_stats[c.content]}" if usage_stats and c.content in usage_stats else ""
+            lines.append(f"    <concept{confidence}{tags}>{c.content}{suffix}</concept>")
         lines.append(f"  </{name}>")
         return "\n".join(lines)
 

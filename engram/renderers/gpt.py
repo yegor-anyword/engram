@@ -56,7 +56,7 @@ class GPTRenderer(ContextRenderer):
             items = [c for c in concepts if c.type == concept_type]
             if not items:
                 continue
-            block = self._render_group(heading, items)
+            block = self._render_group(heading, items, usage_stats)
             block_tokens = self.estimate_tokens(block)
             if current_tokens + block_tokens > token_budget:
                 break
@@ -66,7 +66,7 @@ class GPTRenderer(ContextRenderer):
         # Remaining types
         other = [c for c in concepts if c.type not in categorized_types]
         if other:
-            block = self._render_group("Other Context", other)
+            block = self._render_group("Other Context", other, usage_stats)
             block_tokens = self.estimate_tokens(block)
             if current_tokens + block_tokens <= token_budget:
                 sections.append(block)
@@ -99,9 +99,13 @@ class GPTRenderer(ContextRenderer):
         except Exception:
             return len(text) // 4 + 1
 
-    def _render_group(self, heading: str, concepts: list[ConceptNode]) -> str:
+    def _render_group(
+        self, heading: str, concepts: list[ConceptNode],
+        usage_stats: dict[str, str] | None = None,
+    ) -> str:
         lines = [f"\n## {heading}\n"]
         for c in concepts:
             tag_str = f" `{', '.join(c.domain_tags)}`" if c.domain_tags else ""
-            lines.append(f"- {c.content}{tag_str}")
+            usage = f" {usage_stats[c.content]}" if usage_stats and c.content in usage_stats else ""
+            lines.append(f"- {c.content}{tag_str}{usage}")
         return "\n".join(lines)
