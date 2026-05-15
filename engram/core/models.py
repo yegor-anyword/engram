@@ -541,6 +541,11 @@ class Activity(BaseModel):
     extraction_prompt_version: str | None = None
     bullet_ids_produced: list[str] = Field(default_factory=list)
 
+    # v0.5: DC-inspired worked-example retrieval at materialization time.
+    # Stored alongside the raw input so we can find nearest prior cases by
+    # semantic similarity without re-embedding them on the read path.
+    raw_input_embedding: list[float] | None = None
+
     @staticmethod
     def compute_hash(raw_input: str) -> str:
         """Compute SHA-256 hash of raw input for dedup."""
@@ -698,6 +703,18 @@ class MaterializeRequest(BaseModel):
     include_schemas: bool = True
     recency_weight: float = 0.5
     max_concept_age_days: int | None = None
+
+    # v0.5: DC-inspired retrieval of nearest prior raw inputs as worked examples.
+    include_worked_examples: bool = True
+    worked_example_threshold: float = 0.85
+    worked_example_limit: int = 2
+
+    # v0.5: surface per-bullet usage stats in the rendered text (Phase 5).
+    include_usage_stats: bool = False
+
+    # v0.5: MMR diversity λ in materialization ranking. 1.0 = relevance only
+    # (legacy greedy behavior); 0.7 mixes in diversity (the default).
+    mmr_lambda: float = 0.7
 
 
 class MaterializeResponse(BaseModel):

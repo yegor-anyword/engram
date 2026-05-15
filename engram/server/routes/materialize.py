@@ -40,6 +40,11 @@ async def materialize_context(
         include_schemas=req.include_schemas,
         recency_weight=req.recency_weight,
         max_concept_age_days=req.max_concept_age_days,
+        include_worked_examples=req.include_worked_examples,
+        worked_example_threshold=req.worked_example_threshold,
+        worked_example_limit=req.worked_example_limit,
+        include_usage_stats=req.include_usage_stats,
+        mmr_lambda=req.mmr_lambda,
     )
 
     return MaterializeResponse(

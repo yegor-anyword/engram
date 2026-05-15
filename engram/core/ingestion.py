@@ -669,7 +669,15 @@ class IngestionEngine:
             if op.op_type == DeltaOpType.ADD_BULLET and op.target_id
         ]
 
-        # Record activity WITH raw input preservation (v0.4)
+        # v0.5: embed raw input so future materializations can retrieve it as a
+        # DC-style worked example. Best-effort — recall path tolerates absence.
+        raw_input_embedding: list[float] | None = None
+        try:
+            raw_input_embedding = await self.llm.embed(content)
+        except Exception as exc:
+            logger.warning("Raw-input embedding failed (worked-example retrieval disabled for this commit): %s", exc)
+
+        # Record activity WITH raw input preservation (v0.4) + embedding (v0.5)
         activity = Activity(
             agent_id=agent_id,
             session_id=session_id,
@@ -690,6 +698,8 @@ class IngestionEngine:
             extraction_model=self.ingestion_config.reflector_model,
             extraction_prompt_version=self.ingestion_config.reflector_prompt_version,
             bullet_ids_produced=bullet_ids_produced,
+            # v0.5: worked-example retrieval
+            raw_input_embedding=raw_input_embedding,
         )
         await self.storage.add_activity(context_id, activity)
 

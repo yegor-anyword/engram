@@ -1051,9 +1051,10 @@ class PostgresBackend(StorageBackend):
             "action_type, summary, concepts_created, concepts_updated, "
             "concepts_invalidated, delta_batch_id, materialization_id, "
             "raw_input, raw_input_hash, content_type, source_agent_model, feedback, "
-            "extraction_model, extraction_prompt_version, bullet_ids_produced"
+            "extraction_model, extraction_prompt_version, bullet_ids_produced, "
+            "raw_input_embedding"
             ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, "
-            "$13, $14, $15, $16, $17, $18, $19, $20)",
+            "$13, $14, $15, $16, $17, $18, $19, $20, $21)",
             str(activity.id), str(context_id), activity.timestamp,
             activity.agent_id,
             str(activity.session_id) if activity.session_id else None,
@@ -1068,6 +1069,8 @@ class PostgresBackend(StorageBackend):
             json.dumps(activity.feedback) if activity.feedback else None,
             activity.extraction_model, activity.extraction_prompt_version,
             json.dumps(activity.bullet_ids_produced),
+            # v0.5 worked-example retrieval
+            json.dumps(activity.raw_input_embedding) if activity.raw_input_embedding else None,
         )
         return activity
 
@@ -1135,6 +1138,46 @@ class PostgresBackend(StorageBackend):
             context_id, bullet_ids,
         )
         return [self._row_to_bullet(row) for row in rows]
+
+    async def find_similar_activities(
+        self,
+        context_id: str,
+        embedding: list[float],
+        limit: int = 3,
+        threshold: float = 0.85,
+        exclude_hash: str | None = None,
+    ) -> list[tuple[Activity, float]]:
+        """Cosine similarity over activity raw_input_embedding (JSON column).
+        Loaded in-process — fine at typical activity-ledger scale. Switch to
+        pgvector if a context routinely has >10k activities."""
+        import math
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT * FROM activities WHERE context_id=$1 "
+            "AND raw_input_embedding IS NOT NULL AND raw_input != ''",
+            context_id,
+        )
+
+        def _cos(a: list[float], b: list[float]) -> float:
+            if not a or not b or len(a) != len(b):
+                return 0.0
+            dot = sum(x * y for x, y in zip(a, b))
+            na = math.sqrt(sum(x * x for x in a))
+            nb = math.sqrt(sum(x * x for x in b))
+            return dot / (na * nb) if na and nb else 0.0
+
+        scored: list[tuple[Activity, float]] = []
+        for row in rows:
+            activity = self._row_to_activity(row)
+            if exclude_hash and activity.raw_input_hash == exclude_hash:
+                continue
+            if not activity.raw_input_embedding:
+                continue
+            sim = _cos(embedding, activity.raw_input_embedding)
+            if sim >= threshold:
+                scored.append((activity, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:limit]
 
     # ── Row Converters ─────────────────────────────────────────────────
 
@@ -1238,6 +1281,8 @@ class PostgresBackend(StorageBackend):
         )
         bullet_ids_raw = row["bullet_ids_produced"] if "bullet_ids_produced" in keys else "[]"
         bullet_ids_produced = json.loads(bullet_ids_raw or "[]")
+        emb_raw = row["raw_input_embedding"] if "raw_input_embedding" in keys else None
+        raw_input_embedding = json.loads(emb_raw) if emb_raw else None
 
         return Activity(
             id=uuid.UUID(row["id"]),
@@ -1259,4 +1304,5 @@ class PostgresBackend(StorageBackend):
             extraction_model=extraction_model,
             extraction_prompt_version=extraction_prompt_version,
             bullet_ids_produced=bullet_ids_produced,
+            raw_input_embedding=raw_input_embedding,
         )
