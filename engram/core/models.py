@@ -35,6 +35,11 @@ class BulletType(str, enum.Enum):
     EXCEPTION = "exception"
     PRINCIPLE = "principle"
     DECISION = "decision"
+    # v0.5: Mem-alpha distinguishes episodic memories (timestamped events)
+    # from semantic facts. Episodic bullets follow "At {timestamp}, {actor}
+    # {did X}" and are merged with a looser embedding threshold (multiple
+    # agents often log paraphrases of the same event).
+    EPISODIC = "episodic"
 
 
 class SourceType(str, enum.Enum):

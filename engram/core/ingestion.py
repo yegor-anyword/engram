@@ -84,7 +84,10 @@ Given raw input (and optional execution feedback), extract:
 
 For each insight:
 - Make it ATOMIC (one idea)
-- Classify its type: "strategy", "warning", "fact", "procedure", "exception", "principle", "decision"
+- Classify its type: "strategy", "warning", "fact", "procedure", "exception",
+  "principle", "decision", or "episodic"
+- Use "episodic" for timestamped events ("At 14:30 UTC the user agreed to X");
+  prefix the content with "At {timestamp}, {actor}" when classifying as episodic
 - Suggest a section grouping
 - Rate novelty (0-1, how new vs existing context)
 
@@ -408,18 +411,30 @@ class CuratorEngine:
     ) -> DeltaOperation | None:
         """Process a single insight — fast path (no LLM) or slow path (LLM)."""
 
+        is_episodic = insight.insight_type == BulletType.EPISODIC.value
+
         # Fast path: exact content match → skip
         for existing in existing_bullets:
             if existing.content.strip().lower() == insight.content.strip().lower():
                 logger.debug("Skipping exact duplicate: %s", insight.content[:60])
                 return None
 
-        # Fast path: embedding similarity → merge
+        # Fast path: embedding similarity → merge.
+        # Episodic bullets use a looser threshold (multiple agents often log
+        # paraphrases of the same event) AND merge only against same-type
+        # episodics — a paraphrased event should never collapse into a fact.
         try:
             embedding = await self.llm.embed(insight.content)
+            threshold = 0.85 if is_episodic else 0.92
             similar = await self.storage.find_similar_bullets(
-                context_id, embedding, limit=1, threshold=0.92
+                context_id, embedding, limit=5, threshold=threshold,
             )
+            if is_episodic:
+                similar = [
+                    (b, s) for b, s in similar
+                    if (b.bullet_type.value if hasattr(b.bullet_type, "value")
+                        else str(b.bullet_type)) == "episodic"
+                ]
             if similar:
                 existing_bullet, score = similar[0]
                 logger.debug("Found similar bullet (%.3f): merging", score)
@@ -436,9 +451,10 @@ class CuratorEngine:
         except Exception as exc:
             logger.warning("Embedding dedup failed, adding as new: %s", exc)
 
-        # Fast path: contradiction detection
+        # Fast path: contradiction detection — skip for episodic since each
+        # event is its own atomic record, not a competing claim.
         try:
-            if embedding is not None:  # type: ignore[possibly-undefined]
+            if embedding is not None and not is_episodic:  # type: ignore[possibly-undefined]
                 contradiction = self._detect_contradiction(
                     insight.content, embedding, existing_bullets
                 )
