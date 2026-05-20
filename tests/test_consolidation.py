@@ -22,7 +22,7 @@ from engram.storage.sqlite import SQLiteBackend
 class MockLLMAdapter(LLMAdapter):
     """Mock LLM for consolidation tests."""
 
-    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None):
+    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None, model=None):
         return "Abstract pattern identified from multiple instances."
 
     async def embed(self, text):

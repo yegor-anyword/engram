@@ -250,6 +250,13 @@ class DeltaOperation(BaseModel):
 
     Every mutation goes through delta operations. This prevents
     context collapse and enables full auditability + rollback.
+
+    `previous_state` carries caller-provided input to the apply function
+    (e.g. RECONSOLIDATE_BULLET deltas) when present pre-apply. The apply
+    function writes the snapshot needed for rollback into `rollback_state`
+    so it never clobbers caller input — important for idempotency on retry.
+    Pre-rollback_state op records still place the snapshot in `previous_state`,
+    so the rollback path reads `rollback_state` with fallback to `previous_state`.
     """
 
     id: str = Field(default_factory=_short_id)
@@ -266,6 +273,7 @@ class DeltaOperation(BaseModel):
     session_id: str | None = None
     agent_id: str | None = None
     previous_state: dict[str, Any] | None = None
+    rollback_state: dict[str, Any] | None = None
 
 
 class DeltaBatch(BaseModel):

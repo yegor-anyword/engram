@@ -13,6 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from engram.core.exceptions import LLMAdapterError, StorageError
 from engram.core.models import (
     ActionType,
     Activity,
@@ -24,6 +25,7 @@ from engram.core.models import (
     MaterializationRecord,
     SchemaNode,
 )
+from engram.core.similarity import cosine_similarity
 from engram.llm.adapter import LLMAdapter
 from engram.renderers.base import ContextRenderer
 from engram.renderers.claude import ClaudeRenderer
@@ -49,33 +51,36 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _cosine(a: list[float] | None, b: list[float] | None) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if na and nb else 0.0
+# MMR is only ever used to fill a token budget — at typical bullet sizes that
+# caps how many we'll actually pick. Prefiltering to MMR_CANDIDATE_CAP best-by-
+# relevance candidates keeps the loop O(K^2) instead of O(N^2) on large contexts.
+MMR_CANDIDATE_CAP = 64
 
 
 def _mmr_order(
     bullets: list[Bullet],
     relevance: dict[str, float],
     lambda_: float,
+    candidate_cap: int = MMR_CANDIDATE_CAP,
 ) -> list[Bullet]:
     """Maximal Marginal Relevance ordering.
 
     score(b) = λ * relevance(b) - (1 - λ) * max_sim(b, already_picked)
 
-    Falls back to greedy-by-relevance when λ ≥ 0.999 (legacy behavior) or any
-    bullet lacks an embedding.
+    Falls back to greedy-by-relevance when λ ≥ 0.999 (legacy behavior). Bullets
+    without embeddings contribute zero redundancy — they're ranked purely on
+    relevance (ordering remains stable, just no diversity penalty).
+
+    To stay tractable on large contexts, the candidate set is pre-trimmed to
+    the top `candidate_cap` by relevance before the O(K^2) selection loop runs.
     """
     if lambda_ >= 0.999:
         return [b for b, _ in sorted(
             [(b, relevance.get(b.id, 0.0)) for b in bullets],
             key=lambda x: x[1], reverse=True,
         )]
-    remaining = list(bullets)
+    ranked = sorted(bullets, key=lambda b: relevance.get(b.id, 0.0), reverse=True)
+    remaining = ranked[:candidate_cap]
     picked: list[Bullet] = []
     while remaining:
         best_idx = 0
@@ -85,7 +90,7 @@ def _mmr_order(
             redundancy = 0.0
             if cand.embedding is not None and picked:
                 redundancy = max(
-                    (_cosine(cand.embedding, p.embedding) for p in picked
+                    (cosine_similarity(cand.embedding, p.embedding) for p in picked
                      if p.embedding is not None),
                     default=0.0,
                 )
@@ -328,9 +333,11 @@ class MaterializationEngine:
             selected_bullet_ids.append(bullet.id)
             if include_usage_stats and (bullet.recall_count or bullet.hit_count):
                 # "(used N×, success Y/Z)" surfaces reinforcement signal to the consumer.
+                # Denominator floors at max(recall_count, hit_count) so we never render
+                # "success 3/0" when hit_count was incremented out-of-band from recall.
+                denom = max(bullet.recall_count, bullet.hit_count)
                 usage_stats[bullet.content] = (
-                    f"(used {bullet.recall_count}×, success {bullet.hit_count}/"
-                    f"{bullet.recall_count or 0})"
+                    f"(used {bullet.recall_count}×, success {bullet.hit_count}/{denom})"
                 )
             total_tokens += est
 
@@ -504,12 +511,13 @@ class MaterializationEngine:
 
         Embeds the query, finds the closest prior activities (≥ threshold cosine),
         and returns up to `limit` worked examples each containing the original
-        raw_input and the bullets it produced. Errors are swallowed because this
-        is a best-effort enhancement — materialization still succeeds without it.
+        raw_input and the bullets it produced. Known-recoverable errors (LLM /
+        storage failures) are caught and logged so materialization still
+        succeeds; unexpected errors propagate.
         """
         try:
             query_embedding = await self.llm.embed(search_text)
-        except Exception as exc:
+        except LLMAdapterError as exc:
             logger.warning("Worked-example query embedding failed: %s", exc)
             return []
 
@@ -518,7 +526,7 @@ class MaterializationEngine:
                 context_id, query_embedding,
                 limit=limit, threshold=threshold,
             )
-        except Exception as exc:
+        except StorageError as exc:
             logger.warning("find_similar_activities failed: %s", exc)
             return []
 
@@ -533,7 +541,11 @@ class MaterializationEngine:
                         context_id, activity.bullet_ids_produced,
                     )
                     bullets_text = "; ".join(b.content for b in produced)
-                except Exception:
+                except StorageError as exc:
+                    logger.warning(
+                        "Worked-example bullet fetch failed for activity %s: %s",
+                        activity.id, exc,
+                    )
                     bullets_text = ""
             examples.append({
                 "input": activity.raw_input,

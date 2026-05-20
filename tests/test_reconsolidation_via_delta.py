@@ -128,10 +128,14 @@ async def test_success_reconsolidation_writes_delta_batch(storage, context_id):
     ]
     assert len(reconsolidation_batches) == 1
     op = reconsolidation_batches[0].operations[0]
-    # After apply, previous_state carries a rollback snapshot — the prior values.
-    assert op.previous_state["recall_count"] == 0
-    assert op.previous_state["hit_count"] == 0
-    assert op.previous_state["salience"] == pytest.approx(0.5)
+    # After apply, rollback_state carries the prior values for rollback. The
+    # caller-provided deltas remain untouched in previous_state.
+    assert op.rollback_state["recall_count"] == 0
+    assert op.rollback_state["hit_count"] == 0
+    assert op.rollback_state["salience"] == pytest.approx(0.5)
+    # previous_state still carries the original input deltas — unchanged by apply.
+    assert op.previous_state["recall_delta"] == 1
+    assert op.previous_state["hit_delta"] == 1
 
 
 # ── 2. FAILURE outcome → miss + decay ────────────────────────────────────────

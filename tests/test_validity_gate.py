@@ -36,11 +36,12 @@ class SequencedLLM(LLMAdapter):
         self.responses = list(responses)
         self.calls = 0
 
-    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None):
+    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None, model=None):
         if self.calls >= len(self.responses):
             raise RuntimeError(f"Unexpected extra LLM call #{self.calls}")
         r = self.responses[self.calls]
         self.calls += 1
+        self.last_model = model
         return r
 
     async def embed(self, text):
@@ -178,6 +179,40 @@ async def test_validity_gate_fails_open(storage, context_id):
     # Both insights kept despite judge failure.
     kept = [op.content for op in batch.operations if op.op_type == DeltaOpType.ADD_BULLET]
     assert set(kept) == {"valid insight 1", "valid insight 2"}
+
+
+# ── 4b. Judge call routes via the configured validity_gate_model ─────────────
+
+async def test_validity_gate_passes_model_override(storage, context_id):
+    """The judge call must use validity_gate_model, not the canonical Reflector."""
+    insights = [
+        {"content": "keep me", "insight_type": "fact",
+         "suggested_section": "x", "evidence": "", "novelty": 0.5},
+    ]
+    verdicts = json.dumps({"verdicts": [{"idx": 0, "keep": True}]})
+
+    class ModelTrackingLLM(SequencedLLM):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.models_seen: list[str | None] = []
+
+        async def complete(self, prompt, system=None, temperature=0.0,
+                           max_tokens=4096, response_format=None, model=None):
+            self.models_seen.append(model)
+            return await super().complete(
+                prompt, system, temperature, max_tokens, response_format, model,
+            )
+
+    llm = ModelTrackingLLM([_reflection_response(insights), verdicts])
+    cfg = IngestionConfig(
+        enable_validity_gate=True,
+        validity_gate_model="judge-model-xyz",
+    )
+    engine = IngestionEngine(storage, llm, ingestion_config=cfg)
+    await engine.commit(context_id=context_id, agent_id="t", content="raw")
+
+    # First call is the Reflector (no override → None); second is the judge.
+    assert llm.models_seen == [None, "judge-model-xyz"]
 
 
 # ── 5. Non-ADD ops pass through unchanged ────────────────────────────────────

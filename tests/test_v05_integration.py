@@ -47,7 +47,7 @@ class ScriptedLLM(LLMAdapter):
         self.responses = iter(complete_responses)
         self.calls: list[tuple[str, str | None]] = []
 
-    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None):
+    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None, model=None):
         self.calls.append((prompt, system))
         try:
             return next(self.responses)

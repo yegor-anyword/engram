@@ -178,6 +178,7 @@ class ReflectorEngine:
             system=REFLECTOR_SYSTEM_PROMPT,
             temperature=0.0,
             response_format="json",
+            model=model_override,
         )
 
         try:
@@ -358,7 +359,8 @@ class CuratorEngine:
             "Return JSON with verdicts for each candidate by its bracketed index."
         )
 
-        # Allow temporary model override via ingestion_config.
+        # The validity gate runs on its own (typically cheaper) model rather than
+        # the canonical Reflector — route the override through llm.complete().
         gate_model = self.ingestion_config.validity_gate_model
         try:
             raw = await self.llm.complete(
@@ -366,6 +368,7 @@ class CuratorEngine:
                 system=VALIDITY_GATE_SYSTEM_PROMPT,
                 temperature=0.0,
                 response_format="json",
+                model=gate_model,
             )
             data = json.loads(raw) if not isinstance(raw, dict) else raw
             verdicts = data.get("verdicts", [])
@@ -534,7 +537,7 @@ class CuratorEngine:
         1. Find semantically similar bullets (same topic)
         2. Check for negation signals (opposing conclusions)
         """
-        from engram.storage.sqlite import _cosine_similarity
+        from engram.core.similarity import cosine_similarity as _cosine_similarity
 
         for bullet in existing_bullets:
             if bullet.embedding is None:
@@ -562,7 +565,7 @@ class CuratorEngine:
         This is conservative by default — high-value bullets (high salience + hit rate)
         are kept even if the new model doesn't reproduce them.
         """
-        from engram.storage.sqlite import _cosine_similarity
+        from engram.core.similarity import cosine_similarity as _cosine_similarity
 
         operations: list[DeltaOperation] = []
         matched_old_ids: set[str] = set()
@@ -1033,11 +1036,6 @@ class IngestionEngine:
             len(ops), materialization_id, feedback.outcome.value,
         )
         return batch
-
-        logger.info(
-            "Reconsolidation: updated %d bullets from materialization %s (outcome=%s)",
-            len(record.bullets_included), materialization_id, feedback.outcome.value,
-        )
 
     @staticmethod
     def _revalidate_deltas(batch: DeltaBatch) -> None:

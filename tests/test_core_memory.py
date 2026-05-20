@@ -64,7 +64,7 @@ class CannedLLM(LLMAdapter):
         }
         self.last_prompt: str | None = None
 
-    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None):
+    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None, model=None):
         self.last_prompt = prompt
         return json.dumps(self.response)
 

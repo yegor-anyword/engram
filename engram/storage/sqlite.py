@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +25,7 @@ from engram.core.models import (
     SchemaNode,
     SlotDefinition,
 )
+from engram.core.similarity import cosine_similarity as _cosine_similarity
 from engram.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
@@ -33,17 +33,6 @@ logger = logging.getLogger(__name__)
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 class SQLiteBackend(StorageBackend):
@@ -425,6 +414,7 @@ class SQLiteBackend(StorageBackend):
     async def delete_context(self, context_id: uuid.UUID) -> None:
         db = await self._get_db()
         await db.execute("DELETE FROM contexts WHERE id = ?", (str(context_id),))
+        await db.commit()
 
     async def update_core_memory(
         self, context_id: str, core_memory: str
@@ -434,7 +424,6 @@ class SQLiteBackend(StorageBackend):
             "UPDATE contexts SET core_memory = ?, updated_at = ? WHERE id = ?",
             (core_memory, _utcnow().isoformat(), context_id),
         )
-        await db.commit()
         await db.commit()
 
     # ── Intent ─────────────────────────────────────────────────────────

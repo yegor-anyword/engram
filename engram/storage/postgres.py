@@ -1150,21 +1150,14 @@ class PostgresBackend(StorageBackend):
         """Cosine similarity over activity raw_input_embedding (JSON column).
         Loaded in-process — fine at typical activity-ledger scale. Switch to
         pgvector if a context routinely has >10k activities."""
-        import math
+        from engram.core.similarity import cosine_similarity
+
         pool = await self._get_pool()
         rows = await pool.fetch(
             "SELECT * FROM activities WHERE context_id=$1 "
             "AND raw_input_embedding IS NOT NULL AND raw_input != ''",
             context_id,
         )
-
-        def _cos(a: list[float], b: list[float]) -> float:
-            if not a or not b or len(a) != len(b):
-                return 0.0
-            dot = sum(x * y for x, y in zip(a, b))
-            na = math.sqrt(sum(x * x for x in a))
-            nb = math.sqrt(sum(x * x for x in b))
-            return dot / (na * nb) if na and nb else 0.0
 
         scored: list[tuple[Activity, float]] = []
         for row in rows:
@@ -1173,7 +1166,7 @@ class PostgresBackend(StorageBackend):
                 continue
             if not activity.raw_input_embedding:
                 continue
-            sim = _cos(embedding, activity.raw_input_embedding)
+            sim = cosine_similarity(embedding, activity.raw_input_embedding)
             if sim >= threshold:
                 scored.append((activity, sim))
         scored.sort(key=lambda x: x[1], reverse=True)

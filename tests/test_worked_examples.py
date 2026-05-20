@@ -50,7 +50,7 @@ class ScriptedLLM(LLMAdapter):
         # Fallback: bucket by lowercase first word so similar prompts get similar vectors.
         self.embed_map = embed_map or {}
 
-    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None):
+    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None, model=None):
         return json.dumps(self.response)
 
     async def embed(self, text):

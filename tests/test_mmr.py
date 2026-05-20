@@ -44,7 +44,7 @@ class StubLLM(LLMAdapter):
             "confidence": 0.7,
         }
 
-    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None):
+    async def complete(self, prompt, system=None, temperature=0.0, max_tokens=4096, response_format=None, model=None):
         return json.dumps(self.response)
 
     async def embed(self, text):
