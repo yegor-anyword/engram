@@ -27,6 +27,13 @@ class IngestionConfig(BaseModel):
     curator_dedup_threshold: float = 0.92
     curator_slow_path_model: str = "claude-haiku-4-5"
 
+    # v0.5: Mem-α-inspired content-validity gate. When enabled, the Curator
+    # runs a single batched LLM-judge call across all proposed ADD_BULLET ops
+    # and drops any that fail validity (empty/trivial/malformed). One extra
+    # LLM call per commit — opt-in.
+    enable_validity_gate: bool = False
+    validity_gate_model: str = "claude-haiku-4-5"
+
     # Embedding model — must be consistent within a context
     embedding_model: str = "text-embedding-3-small"
 
@@ -58,6 +65,10 @@ class Settings(BaseSettings):
     max_reflection_rounds: int = 2
     curator_dedup_threshold: float = 0.92
     curator_slow_path_model: str = "claude-haiku-4-5"
+
+    # v0.5: validity gate (off by default — see IngestionConfig)
+    enable_validity_gate: bool = False
+    validity_gate_model: str = "claude-haiku-4-5"
 
 
 @lru_cache

@@ -35,6 +35,11 @@ class BulletType(str, enum.Enum):
     EXCEPTION = "exception"
     PRINCIPLE = "principle"
     DECISION = "decision"
+    # v0.5: Mem-alpha distinguishes episodic memories (timestamped events)
+    # from semantic facts. Episodic bullets follow "At {timestamp}, {actor}
+    # {did X}" and are merged with a looser embedding threshold (multiple
+    # agents often log paraphrases of the same event).
+    EPISODIC = "episodic"
 
 
 class SourceType(str, enum.Enum):
@@ -112,6 +117,8 @@ class DeltaOpType(str, enum.Enum):
     REMOVE_EDGE = "remove_edge"
     ADD_SCHEMA = "add_schema"
     UPDATE_SCHEMA = "update_schema"
+    UPDATE_CORE_MEMORY = "update_core_memory"
+    RECONSOLIDATE_BULLET = "reconsolidate_bullet"
 
 
 class DeltaSource(str, enum.Enum):
@@ -243,6 +250,13 @@ class DeltaOperation(BaseModel):
 
     Every mutation goes through delta operations. This prevents
     context collapse and enables full auditability + rollback.
+
+    `previous_state` carries caller-provided input to the apply function
+    (e.g. RECONSOLIDATE_BULLET deltas) when present pre-apply. The apply
+    function writes the snapshot needed for rollback into `rollback_state`
+    so it never clobbers caller input — important for idempotency on retry.
+    Pre-rollback_state op records still place the snapshot in `previous_state`,
+    so the rollback path reads `rollback_state` with fallback to `previous_state`.
     """
 
     id: str = Field(default_factory=_short_id)
@@ -259,6 +273,7 @@ class DeltaOperation(BaseModel):
     session_id: str | None = None
     agent_id: str | None = None
     previous_state: dict[str, Any] | None = None
+    rollback_state: dict[str, Any] | None = None
 
 
 class DeltaBatch(BaseModel):
@@ -326,6 +341,11 @@ class Reflection(BaseModel):
     rounds_completed: int = 1
     confidence: float = 0.5
     raw_input_type: str = "conversation"
+
+    # Mem-α inspired: optional rewrite of the always-in-context core memory blob.
+    # None means "leave unchanged". A non-None value REPLACES core_memory wholesale,
+    # so the Reflector is instructed to preserve information it wants to keep.
+    core_memory_update: str | None = None
 
 
 # ── Materialization Tracking ──────────────────────────────────────────────
@@ -534,6 +554,11 @@ class Activity(BaseModel):
     extraction_prompt_version: str | None = None
     bullet_ids_produced: list[str] = Field(default_factory=list)
 
+    # v0.5: DC-inspired worked-example retrieval at materialization time.
+    # Stored alongside the raw input so we can find nearest prior cases by
+    # semantic similarity without re-embedding them on the read path.
+    raw_input_embedding: list[float] | None = None
+
     @staticmethod
     def compute_hash(raw_input: str) -> str:
         """Compute SHA-256 hash of raw input for dedup."""
@@ -542,6 +567,9 @@ class Activity(BaseModel):
 
 
 # ── Context (Top-Level Container) ─────────────────────────────────────────
+
+
+CORE_MEMORY_MAX_TOKENS = 512  # Mem-α: bounded always-in-context summary slot.
 
 
 class Context(BaseModel):
@@ -556,6 +584,10 @@ class Context(BaseModel):
     version: int = 1
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+
+    # v0.5: Mem-α inspired core memory — running summary always included in materialization,
+    # rewritten by the Reflector (full-replace) and capped at CORE_MEMORY_MAX_TOKENS.
+    core_memory: str = ""
 
     # v0.3 lifecycle configuration
     lifecycle_config: LifecycleConfig = Field(default_factory=LifecycleConfig)
@@ -684,6 +716,18 @@ class MaterializeRequest(BaseModel):
     include_schemas: bool = True
     recency_weight: float = 0.5
     max_concept_age_days: int | None = None
+
+    # v0.5: DC-inspired retrieval of nearest prior raw inputs as worked examples.
+    include_worked_examples: bool = True
+    worked_example_threshold: float = 0.85
+    worked_example_limit: int = 2
+
+    # v0.5: surface per-bullet usage stats in the rendered text (Phase 5).
+    include_usage_stats: bool = False
+
+    # v0.5: MMR diversity λ in materialization ranking. 1.0 = relevance only
+    # (legacy greedy behavior); 0.7 mixes in diversity (the default).
+    mmr_lambda: float = 0.7
 
 
 class MaterializeResponse(BaseModel):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +25,7 @@ from engram.core.models import (
     SchemaNode,
     SlotDefinition,
 )
+from engram.core.similarity import cosine_similarity as _cosine_similarity
 from engram.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
@@ -33,17 +33,6 @@ logger = logging.getLogger(__name__)
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 class SQLiteBackend(StorageBackend):
@@ -74,7 +63,8 @@ class SQLiteBackend(StorageBackend):
                 owner TEXT DEFAULT 'default',
                 version INTEGER DEFAULT 1,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                core_memory TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS intents (
@@ -229,6 +219,9 @@ class SQLiteBackend(StorageBackend):
         # v0.4 schema migration: add raw input columns to activities
         await self._migrate_v04(db)
 
+        # v0.5 schema migration: Mem-α core memory + DC worked-example activity embeddings
+        await self._migrate_v05(db)
+
         await db.commit()
         logger.info("SQLite storage initialized at %s", self.db_path)
 
@@ -296,6 +289,24 @@ class SQLiteBackend(StorageBackend):
             "ON activities(context_id, raw_input_hash)"
         )
 
+    async def _migrate_v05(self, db: aiosqlite.Connection) -> None:
+        """Add v0.5 columns: core_memory on contexts, raw_input_embedding on activities."""
+        cursor = await db.execute("PRAGMA table_info(contexts)")
+        ctx_cols = {row[1] for row in await cursor.fetchall()}
+        if "core_memory" not in ctx_cols:
+            await db.execute(
+                "ALTER TABLE contexts ADD COLUMN core_memory TEXT DEFAULT ''"
+            )
+            logger.info("Added core_memory column to contexts")
+
+        cursor = await db.execute("PRAGMA table_info(activities)")
+        act_cols = {row[1] for row in await cursor.fetchall()}
+        if "raw_input_embedding" not in act_cols:
+            await db.execute(
+                "ALTER TABLE activities ADD COLUMN raw_input_embedding TEXT"
+            )
+            logger.info("Added raw_input_embedding column to activities")
+
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
@@ -308,10 +319,12 @@ class SQLiteBackend(StorageBackend):
         now = _utcnow().isoformat()
         lifecycle_json = context.lifecycle_config.model_dump_json()
         await db.execute(
-            "INSERT INTO contexts (id, name, description, owner, version, created_at, updated_at, lifecycle_config) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO contexts (id, name, description, owner, version, created_at, updated_at, "
+            "lifecycle_config, core_memory) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(context.id), context.name, context.description, context.owner,
-             context.version, context.created_at.isoformat(), now, lifecycle_json),
+             context.version, context.created_at.isoformat(), now, lifecycle_json,
+             context.core_memory),
         )
         intent = context.intent
         intent.context_id = context.id
@@ -337,12 +350,14 @@ class SQLiteBackend(StorageBackend):
             return None
         lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
         lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+        core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
         return Context(
             id=uuid.UUID(row["id"]), name=row["name"], description=row["description"],
             owner=row["owner"], intent=intent, version=row["version"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             lifecycle_config=lifecycle_config,
+            core_memory=core_memory or "",
         )
 
     async def list_contexts(
@@ -371,12 +386,14 @@ class SQLiteBackend(StorageBackend):
             if intent is not None:
                 lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
                 lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+                core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
                 contexts.append(Context(
                     id=ctx_id, name=row["name"], description=row["description"],
                     owner=row["owner"], intent=intent, version=row["version"],
                     created_at=datetime.fromisoformat(row["created_at"]),
                     updated_at=datetime.fromisoformat(row["updated_at"]),
                     lifecycle_config=lifecycle_config,
+                    core_memory=core_memory or "",
                 ))
         return contexts
 
@@ -397,6 +414,16 @@ class SQLiteBackend(StorageBackend):
     async def delete_context(self, context_id: uuid.UUID) -> None:
         db = await self._get_db()
         await db.execute("DELETE FROM contexts WHERE id = ?", (str(context_id),))
+        await db.commit()
+
+    async def update_core_memory(
+        self, context_id: str, core_memory: str
+    ) -> None:
+        db = await self._get_db()
+        await db.execute(
+            "UPDATE contexts SET core_memory = ?, updated_at = ? WHERE id = ?",
+            (core_memory, _utcnow().isoformat(), context_id),
+        )
         await db.commit()
 
     # ── Intent ─────────────────────────────────────────────────────────
@@ -947,8 +974,9 @@ class SQLiteBackend(StorageBackend):
             "action_type, summary, concepts_created, concepts_updated, concepts_invalidated, "
             "delta_batch_id, materialization_id, "
             "raw_input, raw_input_hash, content_type, source_agent_model, feedback, "
-            "extraction_model, extraction_prompt_version, bullet_ids_produced"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "extraction_model, extraction_prompt_version, bullet_ids_produced, "
+            "raw_input_embedding"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(activity.id), str(context_id), activity.timestamp.isoformat(),
              activity.agent_id,
              str(activity.session_id) if activity.session_id else None,
@@ -962,7 +990,9 @@ class SQLiteBackend(StorageBackend):
              activity.content_type, activity.source_agent_model,
              json.dumps(activity.feedback) if activity.feedback else None,
              activity.extraction_model, activity.extraction_prompt_version,
-             json.dumps(activity.bullet_ids_produced)),
+             json.dumps(activity.bullet_ids_produced),
+             # v0.5 — DC worked-example retrieval
+             json.dumps(activity.raw_input_embedding) if activity.raw_input_embedding else None),
         )
         await db.commit()
         return activity
@@ -1030,6 +1060,36 @@ class SQLiteBackend(StorageBackend):
         )
         rows = await cursor.fetchall()
         return [self._row_to_bullet(row) for row in rows]
+
+    async def find_similar_activities(
+        self,
+        context_id: str,
+        embedding: list[float],
+        limit: int = 3,
+        threshold: float = 0.85,
+        exclude_hash: str | None = None,
+    ) -> list[tuple[Activity, float]]:
+        """Brute-force cosine similarity against all activities with embeddings.
+        Fine for SQLite — production-scale uses Postgres pgvector path."""
+        db = await self._get_db()
+        cursor = await db.execute(
+            "SELECT * FROM activities WHERE context_id=? "
+            "AND raw_input_embedding IS NOT NULL AND raw_input != ''",
+            (context_id,),
+        )
+        rows = await cursor.fetchall()
+        scored: list[tuple[Activity, float]] = []
+        for row in rows:
+            activity = self._row_to_activity(row)
+            if exclude_hash and activity.raw_input_hash == exclude_hash:
+                continue
+            if not activity.raw_input_embedding:
+                continue
+            sim = _cosine_similarity(embedding, activity.raw_input_embedding)
+            if sim >= threshold:
+                scored.append((activity, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:limit]
 
     # ── Row Converters ─────────────────────────────────────────────────
 
@@ -1128,6 +1188,8 @@ class SQLiteBackend(StorageBackend):
         extraction_prompt_version = row["extraction_prompt_version"] if "extraction_prompt_version" in keys else None
         bullet_ids_raw = row["bullet_ids_produced"] if "bullet_ids_produced" in keys else "[]"
         bullet_ids_produced = json.loads(bullet_ids_raw or "[]")
+        emb_raw = row["raw_input_embedding"] if "raw_input_embedding" in keys else None
+        raw_input_embedding = json.loads(emb_raw) if emb_raw else None
 
         return Activity(
             id=uuid.UUID(row["id"]),
@@ -1149,4 +1211,5 @@ class SQLiteBackend(StorageBackend):
             extraction_model=extraction_model,
             extraction_prompt_version=extraction_prompt_version,
             bullet_ids_produced=bullet_ids_produced,
+            raw_input_embedding=raw_input_embedding,
         )

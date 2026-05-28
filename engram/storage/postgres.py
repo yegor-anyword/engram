@@ -86,7 +86,8 @@ class PostgresBackend(StorageBackend):
                         version INTEGER DEFAULT 1,
                         created_at TIMESTAMPTZ NOT NULL,
                         updated_at TIMESTAMPTZ NOT NULL,
-                        lifecycle_config TEXT DEFAULT '{}'
+                        lifecycle_config TEXT DEFAULT '{}',
+                        core_memory TEXT DEFAULT ''
                     )
                 """)
 
@@ -300,6 +301,7 @@ class PostgresBackend(StorageBackend):
         # Schema migrations for existing databases
         await self._migrate_v03(pool)
         await self._migrate_v04(pool)
+        await self._migrate_v05(pool)
 
         safe_dsn = self.dsn.split("@")[-1] if "@" in self.dsn else self.dsn
         logger.info("PostgreSQL storage initialized at %s", safe_dsn)
@@ -365,6 +367,19 @@ class PostgresBackend(StorageBackend):
             "ON activities(context_id, raw_input_hash)"
         )
 
+    async def _migrate_v05(self, pool: asyncpg.Pool) -> None:
+        """v0.5: Mem-α core_memory on contexts, DC activity embedding column."""
+        if not await self._column_exists(pool, "contexts", "core_memory"):
+            await pool.execute(
+                "ALTER TABLE contexts ADD COLUMN core_memory TEXT DEFAULT ''"
+            )
+            logger.info("Added core_memory column to contexts")
+        if not await self._column_exists(pool, "activities", "raw_input_embedding"):
+            await pool.execute(
+                "ALTER TABLE activities ADD COLUMN raw_input_embedding TEXT"
+            )
+            logger.info("Added raw_input_embedding column to activities")
+
     async def close(self) -> None:
         if self._pool is not None:
             await self._pool.close()
@@ -378,10 +393,11 @@ class PostgresBackend(StorageBackend):
         lifecycle_json = context.lifecycle_config.model_dump_json()
         await pool.execute(
             "INSERT INTO contexts (id, name, description, owner, version, "
-            "created_at, updated_at, lifecycle_config) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "created_at, updated_at, lifecycle_config, core_memory) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             str(context.id), context.name, context.description, context.owner,
             context.version, context.created_at, now, lifecycle_json,
+            context.core_memory,
         )
         intent = context.intent
         intent.context_id = context.id
@@ -408,12 +424,14 @@ class PostgresBackend(StorageBackend):
             return None
         lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
         lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+        core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
         return Context(
             id=uuid.UUID(row["id"]), name=row["name"], description=row["description"],
             owner=row["owner"], intent=intent, version=row["version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             lifecycle_config=lifecycle_config,
+            core_memory=core_memory or "",
         )
 
     async def list_contexts(
@@ -444,12 +462,14 @@ class PostgresBackend(StorageBackend):
             if intent is not None:
                 lc_raw = row["lifecycle_config"] if "lifecycle_config" in row.keys() else "{}"
                 lifecycle_config = LifecycleConfig(**json.loads(lc_raw or "{}"))
+                core_memory = row["core_memory"] if "core_memory" in row.keys() else ""
                 contexts.append(Context(
                     id=ctx_id, name=row["name"], description=row["description"],
                     owner=row["owner"], intent=intent, version=row["version"],
                     created_at=row["created_at"],
                     updated_at=row["updated_at"],
                     lifecycle_config=lifecycle_config,
+                    core_memory=core_memory or "",
                 ))
         return contexts
 
@@ -465,6 +485,15 @@ class PostgresBackend(StorageBackend):
         )
         context.updated_at = now
         return context
+
+    async def update_core_memory(
+        self, context_id: str, core_memory: str
+    ) -> None:
+        pool = await self._get_pool()
+        await pool.execute(
+            "UPDATE contexts SET core_memory = $1, updated_at = $2 WHERE id = $3",
+            core_memory, _utcnow(), context_id,
+        )
 
     async def delete_context(self, context_id: uuid.UUID) -> None:
         pool = await self._get_pool()
@@ -1022,9 +1051,10 @@ class PostgresBackend(StorageBackend):
             "action_type, summary, concepts_created, concepts_updated, "
             "concepts_invalidated, delta_batch_id, materialization_id, "
             "raw_input, raw_input_hash, content_type, source_agent_model, feedback, "
-            "extraction_model, extraction_prompt_version, bullet_ids_produced"
+            "extraction_model, extraction_prompt_version, bullet_ids_produced, "
+            "raw_input_embedding"
             ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, "
-            "$13, $14, $15, $16, $17, $18, $19, $20)",
+            "$13, $14, $15, $16, $17, $18, $19, $20, $21)",
             str(activity.id), str(context_id), activity.timestamp,
             activity.agent_id,
             str(activity.session_id) if activity.session_id else None,
@@ -1039,6 +1069,8 @@ class PostgresBackend(StorageBackend):
             json.dumps(activity.feedback) if activity.feedback else None,
             activity.extraction_model, activity.extraction_prompt_version,
             json.dumps(activity.bullet_ids_produced),
+            # v0.5 worked-example retrieval
+            json.dumps(activity.raw_input_embedding) if activity.raw_input_embedding else None,
         )
         return activity
 
@@ -1106,6 +1138,39 @@ class PostgresBackend(StorageBackend):
             context_id, bullet_ids,
         )
         return [self._row_to_bullet(row) for row in rows]
+
+    async def find_similar_activities(
+        self,
+        context_id: str,
+        embedding: list[float],
+        limit: int = 3,
+        threshold: float = 0.85,
+        exclude_hash: str | None = None,
+    ) -> list[tuple[Activity, float]]:
+        """Cosine similarity over activity raw_input_embedding (JSON column).
+        Loaded in-process — fine at typical activity-ledger scale. Switch to
+        pgvector if a context routinely has >10k activities."""
+        from engram.core.similarity import cosine_similarity
+
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            "SELECT * FROM activities WHERE context_id=$1 "
+            "AND raw_input_embedding IS NOT NULL AND raw_input != ''",
+            context_id,
+        )
+
+        scored: list[tuple[Activity, float]] = []
+        for row in rows:
+            activity = self._row_to_activity(row)
+            if exclude_hash and activity.raw_input_hash == exclude_hash:
+                continue
+            if not activity.raw_input_embedding:
+                continue
+            sim = cosine_similarity(embedding, activity.raw_input_embedding)
+            if sim >= threshold:
+                scored.append((activity, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:limit]
 
     # ── Row Converters ─────────────────────────────────────────────────
 
@@ -1209,6 +1274,8 @@ class PostgresBackend(StorageBackend):
         )
         bullet_ids_raw = row["bullet_ids_produced"] if "bullet_ids_produced" in keys else "[]"
         bullet_ids_produced = json.loads(bullet_ids_raw or "[]")
+        emb_raw = row["raw_input_embedding"] if "raw_input_embedding" in keys else None
+        raw_input_embedding = json.loads(emb_raw) if emb_raw else None
 
         return Activity(
             id=uuid.UUID(row["id"]),
@@ -1230,4 +1297,5 @@ class PostgresBackend(StorageBackend):
             extraction_model=extraction_model,
             extraction_prompt_version=extraction_prompt_version,
             bullet_ids_produced=bullet_ids_produced,
+            raw_input_embedding=raw_input_embedding,
         )

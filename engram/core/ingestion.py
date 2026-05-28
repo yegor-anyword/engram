@@ -23,6 +23,7 @@ from engram.core.delta import DeltaEngine
 from engram.core.events import EventBus
 from engram.core.exceptions import CapacityExceededError, IngestionError
 from engram.core.models import (
+    CORE_MEMORY_MAX_TOKENS,
     ActionType,
     Activity,
     Bullet,
@@ -48,6 +49,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _cap_core_memory(text: str, max_tokens: int = CORE_MEMORY_MAX_TOKENS) -> str:
+    """Truncate core memory text to a token budget. Uses tiktoken when available,
+    otherwise falls back to ~4 chars/token. Truncation is on token boundaries so
+    we never emit a half-decoded codepoint."""
+    if not text:
+        return ""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        toks = enc.encode(text)
+        if len(toks) <= max_tokens:
+            return text
+        return enc.decode(toks[:max_tokens])
+    except Exception:
+        char_budget = max_tokens * 4
+        return text if len(text) <= char_budget else text[:char_budget]
+
+
 # ── Reflector ──────────────────────────────────────────────────────────────
 
 
@@ -65,9 +84,20 @@ Given raw input (and optional execution feedback), extract:
 
 For each insight:
 - Make it ATOMIC (one idea)
-- Classify its type: "strategy", "warning", "fact", "procedure", "exception", "principle", "decision"
+- Classify its type: "strategy", "warning", "fact", "procedure", "exception",
+  "principle", "decision", or "episodic"
+- Use "episodic" for timestamped events ("At 14:30 UTC the user agreed to X");
+  prefix the content with "At {timestamp}, {actor}" when classifying as episodic
 - Suggest a section grouping
 - Rate novelty (0-1, how new vs existing context)
+
+You will also see the current CORE MEMORY — a short, always-in-context running
+summary of who, what, and where this context is. If — and only if — there is a
+meaningful update to make (new stable facts about the user/task, a resolved
+ambiguity, a status change), emit `core_memory_update` containing the FULL new
+core memory text. The new value REPLACES the old wholesale, so explicitly carry
+forward anything still relevant. Keep it under ~400 words. Leave it null when no
+change is warranted (the common case).
 
 Respond ONLY with valid JSON:
 {
@@ -79,6 +109,7 @@ Respond ONLY with valid JSON:
   "failure_modes": ["..."],
   "prediction_errors": ["..."],
   "open_questions": ["..."],
+  "core_memory_update": null,
   "confidence": 0.8
 }"""
 
@@ -105,6 +136,7 @@ class ReflectorEngine:
         raw_input: str,
         feedback: ExecutionFeedback | None = None,
         existing_context_summary: str | None = None,
+        existing_core_memory: str | None = None,
         max_rounds: int | None = None,
         model_override: str | None = None,
     ) -> Reflection:
@@ -129,13 +161,24 @@ class ReflectorEngine:
         if existing_context_summary:
             context_text = f"\n\nExisting context summary:\n{existing_context_summary}"
 
-        prompt = f"Analyze this input and extract insights:{context_text}{feedback_text}\n\nRaw input:\n{raw_input}"
+        core_text = ""
+        if existing_core_memory is not None:
+            core_text = (
+                f"\n\nCurrent core memory (running always-in-context summary):\n"
+                f"{existing_core_memory or '(empty)'}"
+            )
+
+        prompt = (
+            f"Analyze this input and extract insights:"
+            f"{context_text}{core_text}{feedback_text}\n\nRaw input:\n{raw_input}"
+        )
 
         raw_response = await self.llm.complete(
             prompt=prompt,
             system=REFLECTOR_SYSTEM_PROMPT,
             temperature=0.0,
             response_format="json",
+            model=model_override,
         )
 
         try:
@@ -159,6 +202,10 @@ class ReflectorEngine:
             for ins in data.get("new_insights", [])
         ]
 
+        core_memory_update = data.get("core_memory_update")
+        if isinstance(core_memory_update, str) and not core_memory_update.strip():
+            core_memory_update = None
+
         return Reflection(
             new_insights=insights,
             strategies_that_worked=data.get("strategies_that_worked", []),
@@ -168,10 +215,27 @@ class ReflectorEngine:
             rounds_completed=1,
             confidence=data.get("confidence", 0.5),
             raw_input_type="conversation",
+            core_memory_update=core_memory_update if isinstance(core_memory_update, str) else None,
         )
 
 
 # ── Curator ────────────────────────────────────────────────────────────────
+
+
+VALIDITY_GATE_SYSTEM_PROMPT = """\
+You are the Validity Gate in a memory ingestion pipeline. Each proposed write
+is a short bullet that will become a long-lived memory item. Your job is to
+reject writes that are NOT worth storing:
+- empty / whitespace only / placeholder
+- trivially restates the input or a tautology
+- malformed (truncated mid-sentence, garbled, not a complete idea)
+- pure conversational filler ("ok", "sounds good", "thanks")
+Keep writes that are concrete, non-trivial knowledge — facts, decisions,
+strategies, warnings, procedures, exceptions, principles.
+
+Return ONLY valid JSON of the form:
+{"verdicts": [{"idx": 0, "keep": true}, {"idx": 1, "keep": false, "reason": "..."}, ...]}
+"""
 
 
 class CuratorEngine:
@@ -184,9 +248,15 @@ class CuratorEngine:
     (embedding dedup, deterministic merge). Only complex conflicts need LLM.
     """
 
-    def __init__(self, storage: StorageBackend, llm: LLMAdapter) -> None:
+    def __init__(
+        self,
+        storage: StorageBackend,
+        llm: LLMAdapter,
+        ingestion_config: IngestionConfig | None = None,
+    ) -> None:
         self.storage = storage
         self.llm = llm
+        self.ingestion_config = ingestion_config or IngestionConfig()
 
     async def curate(
         self,
@@ -251,12 +321,88 @@ class CuratorEngine:
                 session_id=session_id,
             ))
 
+        # Mem-α-inspired validity gate: drop malformed/trivial ADD_BULLET ops
+        # via a single batched LLM judge call. Opt-in to avoid the extra cost.
+        if self.ingestion_config.enable_validity_gate and operations:
+            operations = await self._filter_invalid_ops(operations)
+
         batch = DeltaBatch(
             context_id=context_id,
             operations=operations,
             trigger="commit",
         )
         return batch
+
+    async def _filter_invalid_ops(
+        self, ops: list[DeltaOperation],
+    ) -> list[DeltaOperation]:
+        """Run a batched LLM judge over all ADD_BULLET ops; drop the ones it
+        rejects. Non-ADD ops pass through untouched. Errors fall back to
+        keeping everything (fail-open — we'd rather store too much than too
+        little when the judge is unavailable)."""
+        add_ops_with_idx = [
+            (i, op) for i, op in enumerate(ops)
+            if op.op_type == DeltaOpType.ADD_BULLET and op.content
+        ]
+        if not add_ops_with_idx:
+            return ops
+
+        # Build a numbered list for the judge.
+        candidate_text = "\n".join(
+            f"[{i}] {op.content}" for i, (_, op) in enumerate(add_ops_with_idx)
+        )
+        prompt = (
+            "Evaluate each candidate memory write below. Reject any that are "
+            "empty, malformed, trivial, conversational filler, or otherwise "
+            "not worth storing as a long-lived memory item.\n\n"
+            f"Candidates:\n{candidate_text}\n\n"
+            "Return JSON with verdicts for each candidate by its bracketed index."
+        )
+
+        # The validity gate runs on its own (typically cheaper) model rather than
+        # the canonical Reflector — route the override through llm.complete().
+        gate_model = self.ingestion_config.validity_gate_model
+        try:
+            raw = await self.llm.complete(
+                prompt=prompt,
+                system=VALIDITY_GATE_SYSTEM_PROMPT,
+                temperature=0.0,
+                response_format="json",
+                model=gate_model,
+            )
+            data = json.loads(raw) if not isinstance(raw, dict) else raw
+            verdicts = data.get("verdicts", [])
+        except Exception as exc:
+            logger.warning(
+                "Validity gate (%s) failed, passing all ops through: %s",
+                gate_model, exc,
+            )
+            return ops
+
+        # Map judge indices back to op positions.
+        rejected_judge_indices: set[int] = set()
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            try:
+                jidx = int(v.get("idx", -1))
+            except (TypeError, ValueError):
+                continue
+            if v.get("keep") is False and 0 <= jidx < len(add_ops_with_idx):
+                rejected_judge_indices.add(jidx)
+                logger.debug(
+                    "Validity gate rejected: %s (reason: %s)",
+                    add_ops_with_idx[jidx][1].content[:80],
+                    v.get("reason", "unspecified"),
+                )
+
+        if not rejected_judge_indices:
+            return ops
+
+        rejected_op_positions = {
+            add_ops_with_idx[j][0] for j in rejected_judge_indices
+        }
+        return [op for i, op in enumerate(ops) if i not in rejected_op_positions]
 
     async def _process_insight(
         self,
@@ -268,18 +414,30 @@ class CuratorEngine:
     ) -> DeltaOperation | None:
         """Process a single insight — fast path (no LLM) or slow path (LLM)."""
 
+        is_episodic = insight.insight_type == BulletType.EPISODIC.value
+
         # Fast path: exact content match → skip
         for existing in existing_bullets:
             if existing.content.strip().lower() == insight.content.strip().lower():
                 logger.debug("Skipping exact duplicate: %s", insight.content[:60])
                 return None
 
-        # Fast path: embedding similarity → merge
+        # Fast path: embedding similarity → merge.
+        # Episodic bullets use a looser threshold (multiple agents often log
+        # paraphrases of the same event) AND merge only against same-type
+        # episodics — a paraphrased event should never collapse into a fact.
         try:
             embedding = await self.llm.embed(insight.content)
+            threshold = 0.85 if is_episodic else 0.92
             similar = await self.storage.find_similar_bullets(
-                context_id, embedding, limit=1, threshold=0.92
+                context_id, embedding, limit=5, threshold=threshold,
             )
+            if is_episodic:
+                similar = [
+                    (b, s) for b, s in similar
+                    if (b.bullet_type.value if hasattr(b.bullet_type, "value")
+                        else str(b.bullet_type)) == "episodic"
+                ]
             if similar:
                 existing_bullet, score = similar[0]
                 logger.debug("Found similar bullet (%.3f): merging", score)
@@ -296,9 +454,10 @@ class CuratorEngine:
         except Exception as exc:
             logger.warning("Embedding dedup failed, adding as new: %s", exc)
 
-        # Fast path: contradiction detection
+        # Fast path: contradiction detection — skip for episodic since each
+        # event is its own atomic record, not a competing claim.
         try:
-            if embedding is not None:  # type: ignore[possibly-undefined]
+            if embedding is not None and not is_episodic:  # type: ignore[possibly-undefined]
                 contradiction = self._detect_contradiction(
                     insight.content, embedding, existing_bullets
                 )
@@ -378,7 +537,7 @@ class CuratorEngine:
         1. Find semantically similar bullets (same topic)
         2. Check for negation signals (opposing conclusions)
         """
-        from engram.storage.sqlite import _cosine_similarity
+        from engram.core.similarity import cosine_similarity as _cosine_similarity
 
         for bullet in existing_bullets:
             if bullet.embedding is None:
@@ -406,7 +565,7 @@ class CuratorEngine:
         This is conservative by default — high-value bullets (high salience + hit rate)
         are kept even if the new model doesn't reproduce them.
         """
-        from engram.storage.sqlite import _cosine_similarity
+        from engram.core.similarity import cosine_similarity as _cosine_similarity
 
         operations: list[DeltaOperation] = []
         matched_old_ids: set[str] = set()
@@ -516,7 +675,7 @@ class IngestionEngine:
         self.event_bus = event_bus
         self.ingestion_config = ingestion_config or IngestionConfig()
         self.reflector = ReflectorEngine(llm, config=self.ingestion_config)
-        self.curator = CuratorEngine(storage, llm)
+        self.curator = CuratorEngine(storage, llm, ingestion_config=self.ingestion_config)
         self.delta_engine = DeltaEngine(storage)
 
     async def commit(
@@ -554,15 +713,18 @@ class IngestionEngine:
                 )
                 return existing_batch
 
-        # Build context summary for the Reflector
+        # Build context summary + load core memory for the Reflector
         existing_bullets = await self.storage.list_bullets(ctx_id_str)
         summary = self._summarize_bullets(existing_bullets) if existing_bullets else None
+        existing_context = await self.storage.get_context(context_id)
+        existing_core_memory = existing_context.core_memory if existing_context else ""
 
         # Phase 1: Reflect (using CANONICAL model from config)
         reflection = await self.reflector.reflect(
             raw_input=content,
             feedback=feedback,
             existing_context_summary=summary,
+            existing_core_memory=existing_core_memory,
         )
 
         # Phase 2: Curate
@@ -572,6 +734,22 @@ class IngestionEngine:
             agent_id=agent_id,
             session_id=str(session_id) if session_id else None,
         )
+
+        # Phase 2.5: Append a core memory update op if the Reflector proposed one.
+        # Going through DeltaEngine keeps the change auditable + rollback-able.
+        if reflection.core_memory_update is not None:
+            new_core = _cap_core_memory(reflection.core_memory_update)
+            if new_core != existing_core_memory:
+                batch.operations.append(DeltaOperation(
+                    op_type=DeltaOpType.UPDATE_CORE_MEMORY,
+                    target_id=ctx_id_str,
+                    content=new_core,
+                    reasoning="Reflector emitted a core memory update.",
+                    source=DeltaSource.REFLECTOR,
+                    confidence=reflection.confidence,
+                    agent_id=agent_id,
+                    session_id=str(session_id) if session_id else None,
+                ))
 
         # v0.3: Capacity check before applying deltas
         net_adds = sum(
@@ -606,7 +784,15 @@ class IngestionEngine:
             if op.op_type == DeltaOpType.ADD_BULLET and op.target_id
         ]
 
-        # Record activity WITH raw input preservation (v0.4)
+        # v0.5: embed raw input so future materializations can retrieve it as a
+        # DC-style worked example. Best-effort — recall path tolerates absence.
+        raw_input_embedding: list[float] | None = None
+        try:
+            raw_input_embedding = await self.llm.embed(content)
+        except Exception as exc:
+            logger.warning("Raw-input embedding failed (worked-example retrieval disabled for this commit): %s", exc)
+
+        # Record activity WITH raw input preservation (v0.4) + embedding (v0.5)
         activity = Activity(
             agent_id=agent_id,
             session_id=session_id,
@@ -627,12 +813,18 @@ class IngestionEngine:
             extraction_model=self.ingestion_config.reflector_model,
             extraction_prompt_version=self.ingestion_config.reflector_prompt_version,
             bullet_ids_produced=bullet_ids_produced,
+            # v0.5: worked-example retrieval
+            raw_input_embedding=raw_input_embedding,
         )
         await self.storage.add_activity(context_id, activity)
 
-        # Reconsolidation: if this commit references a materialization, update bullet stats
+        # Reconsolidation: if this commit references a materialization, update
+        # bullet stats via a delta batch (audit-clean, rollback-able).
         if materialization_id and feedback:
-            await self._reconsolidate(materialization_id, feedback)
+            await self._reconsolidate(
+                materialization_id, feedback,
+                agent_id=agent_id, session_id=session_id,
+            )
 
         # v0.3: Emit event
         if self.event_bus is not None:
@@ -780,35 +972,70 @@ class IngestionEngine:
         return decision_id, batch
 
     async def _reconsolidate(
-        self, materialization_id: str, feedback: ExecutionFeedback
-    ) -> None:
-        """Post-recall reconsolidation — update bullet usage stats."""
+        self, materialization_id: str, feedback: ExecutionFeedback,
+        agent_id: str | None = None, session_id: uuid.UUID | None = None,
+    ) -> DeltaBatch | None:
+        """Post-recall reconsolidation, routed through the DeltaEngine.
+
+        Emits one RECONSOLIDATE_BULLET op per bullet in the recall, applied as
+        a single batch so the audit trail / rollback story is consistent with
+        every other mutation. (README claim: "all mutations through deltas.")
+        """
         record = await self.storage.get_materialization(materialization_id)
         if record is None:
             logger.warning("Materialization %s not found for reconsolidation", materialization_id)
-            return
+            return None
 
+        # Decide the per-bullet effect from the outcome once.
+        if feedback.outcome == FeedbackOutcome.SUCCESS:
+            recall_delta, hit_delta, miss_delta, mult = 1, 1, 0, 1.05
+        elif feedback.outcome == FeedbackOutcome.FAILURE:
+            recall_delta, hit_delta, miss_delta, mult = 1, 0, 1, 0.95
+        else:
+            recall_delta, hit_delta, miss_delta, mult = 1, 0, 0, 1.00
+
+        ops: list[DeltaOperation] = []
         for bullet_id in record.bullets_included:
-            bullet = await self.storage.get_bullet(bullet_id)
-            if bullet is None:
-                continue
+            ops.append(DeltaOperation(
+                op_type=DeltaOpType.RECONSOLIDATE_BULLET,
+                target_id=bullet_id,
+                reasoning=(
+                    f"Reconsolidation from materialization {materialization_id} "
+                    f"(outcome={feedback.outcome.value})"
+                ),
+                source=DeltaSource.REFLECTOR,
+                confidence=0.9,
+                agent_id=agent_id,
+                session_id=str(session_id) if session_id else None,
+                # previous_state carries the *input* deltas; DeltaEngine swaps
+                # it for a rollback snapshot after applying.
+                previous_state={
+                    "recall_delta": recall_delta,
+                    "hit_delta": hit_delta,
+                    "miss_delta": miss_delta,
+                    "salience_multiplier": mult,
+                    "outcome": feedback.outcome.value,
+                },
+            ))
+        if not ops:
+            return None
 
-            bullet.recall_count += 1
-            bullet.last_recalled_at = _utcnow()
-
-            if feedback.outcome == FeedbackOutcome.SUCCESS:
-                bullet.hit_count += 1
-                bullet.salience = min(1.0, bullet.salience * 1.05)
-            elif feedback.outcome == FeedbackOutcome.FAILURE:
-                bullet.miss_count += 1
-                bullet.salience = max(0.05, bullet.salience * 0.95)
-
-            await self.storage.update_bullet(bullet)
+        batch = DeltaBatch(
+            context_id=record.context_id,
+            operations=ops,
+            trigger="reconsolidation",
+        )
+        if self.lock_manager is not None:
+            async with self.lock_manager.acquire(record.context_id):
+                batch = await self.delta_engine.apply_batch(batch)
+        else:
+            batch = await self.delta_engine.apply_batch(batch)
 
         logger.info(
-            "Reconsolidation: updated %d bullets from materialization %s (outcome=%s)",
-            len(record.bullets_included), materialization_id, feedback.outcome.value,
+            "Reconsolidation: %d bullets updated from materialization %s (outcome=%s)",
+            len(ops), materialization_id, feedback.outcome.value,
         )
+        return batch
 
     @staticmethod
     def _revalidate_deltas(batch: DeltaBatch) -> None:

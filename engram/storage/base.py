@@ -57,6 +57,12 @@ class StorageBackend(abc.ABC):
     async def delete_context(self, context_id: uuid.UUID) -> None:
         """Hard-delete a context and all associated data."""
 
+    @abc.abstractmethod
+    async def update_core_memory(
+        self, context_id: str, core_memory: str
+    ) -> None:
+        """Replace the always-in-context core memory blob for a context."""
+
     # ── Intent ─────────────────────────────────────────────────────────
 
     @abc.abstractmethod
@@ -280,3 +286,19 @@ class StorageBackend(abc.ABC):
         self, context_id: str, bullet_ids: list[str],
     ) -> list[Bullet]:
         """Get multiple bullets by their IDs."""
+
+    @abc.abstractmethod
+    async def find_similar_activities(
+        self,
+        context_id: str,
+        embedding: list[float],
+        limit: int = 3,
+        threshold: float = 0.85,
+        exclude_hash: str | None = None,
+    ) -> list[tuple[Activity, float]]:
+        """Find prior activities (with raw_input + embedding) most similar to
+        the given embedding. Returns [(activity, cosine_similarity), ...] sorted
+        descending by similarity, filtered to similarity >= threshold.
+
+        exclude_hash skips an activity whose raw_input_hash matches (e.g., the
+        commit currently being materialized against)."""

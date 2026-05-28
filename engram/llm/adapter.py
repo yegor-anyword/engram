@@ -23,8 +23,14 @@ class LLMAdapter(abc.ABC):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         response_format: str | None = None,
+        model: str | None = None,
     ) -> str:
-        """Generate a completion from the LLM."""
+        """Generate a completion from the LLM.
+
+        `model` overrides the adapter's default for this call only. Used by the
+        validity gate and re-extraction to route to a different model than the
+        canonical Reflector.
+        """
 
     @abc.abstractmethod
     async def embed(self, text: str) -> list[float]:
@@ -53,6 +59,7 @@ class LiteLLMAdapter(LLMAdapter):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         response_format: str | None = None,
+        model: str | None = None,
     ) -> str:
         import litellm
 
@@ -62,7 +69,7 @@ class LiteLLMAdapter(LLMAdapter):
         messages.append({"role": "user", "content": prompt})
 
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,

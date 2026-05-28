@@ -371,8 +371,21 @@ class Engram:
         include_schemas: bool = True,
         recency_weight: float = 0.5,
         max_concept_age_days: int | None = None,
+        include_worked_examples: bool = True,
+        worked_example_threshold: float = 0.85,
+        worked_example_limit: int = 2,
+        include_usage_stats: bool = False,
+        mmr_lambda: float = 0.7,
     ) -> dict[str, Any]:
-        """Materialize context for an agent. Returns materialization_id for reconsolidation."""
+        """Materialize context for an agent. Returns materialization_id for reconsolidation.
+
+        v0.5 extensions:
+          - include_worked_examples / worked_example_threshold / worked_example_limit:
+            DC-style retrieval of nearest prior raw inputs attached as worked
+            examples at the end of the rendered context.
+          - include_usage_stats: surface hit/recall counters per bullet.
+          - mmr_lambda: diversity weight for bullet ranking (1.0 = relevance only).
+        """
         req = MaterializeRequest(
             query=query,
             task=task,
@@ -386,6 +399,11 @@ class Engram:
             include_schemas=include_schemas,
             recency_weight=recency_weight,
             max_concept_age_days=max_concept_age_days,
+            include_worked_examples=include_worked_examples,
+            worked_example_threshold=worked_example_threshold,
+            worked_example_limit=worked_example_limit,
+            include_usage_stats=include_usage_stats,
+            mmr_lambda=mmr_lambda,
         )
         resp = await self._client.post(
             f"/contexts/{context_id}/materialize",

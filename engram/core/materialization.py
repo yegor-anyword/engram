@@ -13,6 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from engram.core.exceptions import LLMAdapterError, StorageError
 from engram.core.models import (
     ActionType,
     Activity,
@@ -24,6 +25,7 @@ from engram.core.models import (
     MaterializationRecord,
     SchemaNode,
 )
+from engram.core.similarity import cosine_similarity
 from engram.llm.adapter import LLMAdapter
 from engram.renderers.base import ContextRenderer
 from engram.renderers.claude import ClaudeRenderer
@@ -47,6 +49,57 @@ RENDERER_MAP: dict[str, type[ContextRenderer]] = {
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# MMR is only ever used to fill a token budget — at typical bullet sizes that
+# caps how many we'll actually pick. Prefiltering to MMR_CANDIDATE_CAP best-by-
+# relevance candidates keeps the loop O(K^2) instead of O(N^2) on large contexts.
+MMR_CANDIDATE_CAP = 64
+
+
+def _mmr_order(
+    bullets: list[Bullet],
+    relevance: dict[str, float],
+    lambda_: float,
+    candidate_cap: int = MMR_CANDIDATE_CAP,
+) -> list[Bullet]:
+    """Maximal Marginal Relevance ordering.
+
+    score(b) = λ * relevance(b) - (1 - λ) * max_sim(b, already_picked)
+
+    Falls back to greedy-by-relevance when λ ≥ 0.999 (legacy behavior). Bullets
+    without embeddings contribute zero redundancy — they're ranked purely on
+    relevance (ordering remains stable, just no diversity penalty).
+
+    To stay tractable on large contexts, the candidate set is pre-trimmed to
+    the top `candidate_cap` by relevance before the O(K^2) selection loop runs.
+    """
+    if lambda_ >= 0.999:
+        return [b for b, _ in sorted(
+            [(b, relevance.get(b.id, 0.0)) for b in bullets],
+            key=lambda x: x[1], reverse=True,
+        )]
+    ranked = sorted(bullets, key=lambda b: relevance.get(b.id, 0.0), reverse=True)
+    remaining = ranked[:candidate_cap]
+    picked: list[Bullet] = []
+    while remaining:
+        best_idx = 0
+        best_score = -math.inf
+        for i, cand in enumerate(remaining):
+            rel = relevance.get(cand.id, 0.0)
+            redundancy = 0.0
+            if cand.embedding is not None and picked:
+                redundancy = max(
+                    (cosine_similarity(cand.embedding, p.embedding) for p in picked
+                     if p.embedding is not None),
+                    default=0.0,
+                )
+            mmr = lambda_ * rel - (1 - lambda_) * redundancy
+            if mmr > best_score:
+                best_score = mmr
+                best_idx = i
+        picked.append(remaining.pop(best_idx))
+    return picked
 
 
 class MaterializationEngine:
@@ -78,6 +131,11 @@ class MaterializationEngine:
         include_schemas: bool = True,
         recency_weight: float = 0.5,
         max_concept_age_days: int | None = None,
+        include_worked_examples: bool = True,
+        worked_example_threshold: float = 0.85,
+        worked_example_limit: int = 2,
+        include_usage_stats: bool = False,
+        mmr_lambda: float = 0.7,
     ) -> dict[str, Any]:
         """Materialize context from the graph.
 
@@ -86,10 +144,12 @@ class MaterializationEngine:
         """
         ctx_id_str = str(context_id)
 
-        # 1. Load intent
+        # 1. Load intent + core memory (Mem-α: always-in-context summary)
         intent: IntentAnchor | None = None
         if include_intent:
             intent = await self.storage.get_intent(context_id)
+        context_obj = await self.storage.get_context(context_id)
+        core_memory = context_obj.core_memory if context_obj else ""
 
         # 2. Load bullets (primary v0.2 storage)
         all_bullets = await self.storage.list_bullets(ctx_id_str)
@@ -112,22 +172,41 @@ class MaterializationEngine:
 
         renderer = self._get_renderer(target_model)
 
+        # v0.5: fetch worked examples (DC-style nearest-prior-input retrieval).
+        search_text = query or task or ""
+        worked_examples: list[dict[str, str]] = []
+        if include_worked_examples and search_text:
+            worked_examples = await self._fetch_worked_examples(
+                ctx_id_str, search_text,
+                threshold=worked_example_threshold,
+                limit=worked_example_limit,
+            )
+
         # If we have bullets, use bullet-based materialization
         if all_bullets:
             result = await self._materialize_bullets(
                 ctx_id_str, context_id, all_bullets, schemas, intent,
-                query or task or "", focus_domains or [], recency_weight,
+                search_text, focus_domains or [], recency_weight,
                 include_decisions, token_budget, target_model, renderer,
+                core_memory=core_memory,
+                worked_examples=worked_examples,
+                include_usage_stats=include_usage_stats,
+                mmr_lambda=mmr_lambda,
             )
         elif all_concepts:
             # Fallback to legacy concept-based materialization
             result = await self._materialize_concepts(
-                context_id, all_concepts, intent, query or task or "",
+                context_id, all_concepts, intent, search_text,
                 focus_domains or [], recency_weight, include_decisions,
                 token_budget, target_model, renderer,
+                core_memory=core_memory,
+                worked_examples=worked_examples,
             )
         else:
-            text = renderer.render([], intent, token_budget)
+            text = renderer.render(
+                [], intent, token_budget,
+                core_memory=core_memory, worked_examples=worked_examples or None,
+            )
             result = {
                 "materialization_id": str(uuid.uuid4()),
                 "rendered_text": text,
@@ -181,8 +260,12 @@ class MaterializationEngine:
         focus_domains: list[str], recency_weight: float,
         include_decisions: bool, token_budget: int,
         target_model: str, renderer: ContextRenderer,
+        core_memory: str = "",
+        worked_examples: list[dict[str, str]] | None = None,
+        include_usage_stats: bool = False,
+        mmr_lambda: float = 0.7,
     ) -> dict[str, Any]:
-        """Bullet-based materialization with effective salience ranking."""
+        """Bullet-based materialization with effective salience ranking + MMR diversity."""
         mat_id = str(uuid.uuid4())
 
         # Score bullets
@@ -190,22 +273,33 @@ class MaterializationEngine:
             ctx_id_str, bullets, search_text, recency_weight, include_decisions,
         )
 
-        sorted_bullets = sorted(
-            [(b, scores.get(b.id, 0.0)) for b in bullets],
-            key=lambda x: x[1], reverse=True,
-        )
+        # MMR re-ordering: pick each next bullet to maximize relevance minus the
+        # max similarity to already-picked. Avoids packing the token budget with
+        # 10 near-duplicates of the top-scoring bullet.
+        ordered_bullets = _mmr_order(bullets, scores, mmr_lambda)
 
         # Convert top bullets to ConceptNodes for renderer (backward compat with renderers)
         selected_concepts: list[ConceptNode] = []
         selected_bullet_ids: list[str] = []
+        usage_stats: dict[str, str] = {}
         total_tokens = 0
 
         intent_budget = 0
-        if intent:
-            intent_text = renderer.render([], intent, token_budget)
+        if intent or core_memory:
+            intent_text = renderer.render([], intent, token_budget, core_memory=core_memory)
             intent_budget = renderer.estimate_tokens(intent_text)
 
-        remaining = token_budget - intent_budget
+        # Reserve some headroom for worked examples (rendered at the end).
+        worked_example_budget = 0
+        if worked_examples:
+            wx_text_estimate = sum(
+                renderer.estimate_tokens((ex.get("input") or "") + (ex.get("output") or ""))
+                + 30
+                for ex in worked_examples
+            )
+            worked_example_budget = wx_text_estimate
+
+        remaining = max(0, token_budget - intent_budget - worked_example_budget)
 
         # Include schema summaries first (token-efficient)
         schema_ids: list[str] = []
@@ -223,7 +317,7 @@ class MaterializationEngine:
                     schema_ids.append(schema.id)
 
         # Pack bullets into remaining budget
-        for bullet, score in sorted_bullets:
+        for bullet in ordered_bullets:
             est = renderer.estimate_tokens(bullet.content) + 10
             if total_tokens + est > remaining:
                 break
@@ -237,9 +331,22 @@ class MaterializationEngine:
                 confidence=bullet.confidence,
             ))
             selected_bullet_ids.append(bullet.id)
+            if include_usage_stats and (bullet.recall_count or bullet.hit_count):
+                # "(used N×, success Y/Z)" surfaces reinforcement signal to the consumer.
+                # Denominator floors at max(recall_count, hit_count) so we never render
+                # "success 3/0" when hit_count was incremented out-of-band from recall.
+                denom = max(bullet.recall_count, bullet.hit_count)
+                usage_stats[bullet.content] = (
+                    f"(used {bullet.recall_count}×, success {bullet.hit_count}/{denom})"
+                )
             total_tokens += est
 
-        rendered = renderer.render(selected_concepts, intent, token_budget)
+        rendered = renderer.render(
+            selected_concepts, intent, token_budget,
+            core_memory=core_memory,
+            worked_examples=worked_examples or None,
+            usage_stats=usage_stats or None,
+        )
         actual_tokens = renderer.estimate_tokens(rendered)
         coverage = len(selected_bullet_ids) / len(bullets) if bullets else 0.0
 
@@ -259,6 +366,8 @@ class MaterializationEngine:
         focus_domains: list[str], recency_weight: float,
         include_decisions: bool, token_budget: int,
         target_model: str, renderer: ContextRenderer,
+        core_memory: str = "",
+        worked_examples: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Legacy concept-based materialization."""
         mat_id = str(uuid.uuid4())
@@ -275,8 +384,8 @@ class MaterializationEngine:
         total_tokens = 0
 
         intent_budget = 0
-        if intent:
-            intent_text = renderer.render([], intent, token_budget)
+        if intent or core_memory:
+            intent_text = renderer.render([], intent, token_budget, core_memory=core_memory)
             intent_budget = renderer.estimate_tokens(intent_text)
         remaining = token_budget - intent_budget
 
@@ -290,7 +399,11 @@ class MaterializationEngine:
             selected.append(concept)
             total_tokens += est
 
-        rendered = renderer.render(selected, intent, token_budget)
+        rendered = renderer.render(
+            selected, intent, token_budget,
+            core_memory=core_memory,
+            worked_examples=worked_examples or None,
+        )
         actual_tokens = renderer.estimate_tokens(rendered)
         coverage = len(selected) / len(concepts) if concepts else 0.0
 
@@ -386,6 +499,60 @@ class MaterializationEngine:
             scores[concept.id] = combined
 
         return scores
+
+    async def _fetch_worked_examples(
+        self,
+        context_id: str,
+        search_text: str,
+        threshold: float,
+        limit: int,
+    ) -> list[dict[str, str]]:
+        """DC-inspired nearest-prior-input retrieval.
+
+        Embeds the query, finds the closest prior activities (≥ threshold cosine),
+        and returns up to `limit` worked examples each containing the original
+        raw_input and the bullets it produced. Known-recoverable errors (LLM /
+        storage failures) are caught and logged so materialization still
+        succeeds; unexpected errors propagate.
+        """
+        try:
+            query_embedding = await self.llm.embed(search_text)
+        except LLMAdapterError as exc:
+            logger.warning("Worked-example query embedding failed: %s", exc)
+            return []
+
+        try:
+            hits = await self.storage.find_similar_activities(
+                context_id, query_embedding,
+                limit=limit, threshold=threshold,
+            )
+        except StorageError as exc:
+            logger.warning("find_similar_activities failed: %s", exc)
+            return []
+
+        examples: list[dict[str, str]] = []
+        for activity, sim in hits:
+            if not activity.raw_input:
+                continue
+            bullets_text = ""
+            if activity.bullet_ids_produced:
+                try:
+                    produced = await self.storage.get_bullets_by_ids(
+                        context_id, activity.bullet_ids_produced,
+                    )
+                    bullets_text = "; ".join(b.content for b in produced)
+                except StorageError as exc:
+                    logger.warning(
+                        "Worked-example bullet fetch failed for activity %s: %s",
+                        activity.id, exc,
+                    )
+                    bullets_text = ""
+            examples.append({
+                "input": activity.raw_input,
+                "output": bullets_text,
+                "similarity": f"{sim:.2f}",
+            })
+        return examples
 
     @staticmethod
     def _spreading_activation(
