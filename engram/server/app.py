@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         re_reflector, re_curator, storage, lock_manager, event_bus,
     )
 
-    logger.info("Engram server started (v0.4)")
+    logger.info("Engram server started (v0.5)")
     yield
 
     await storage.close()
@@ -117,7 +117,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Engram",
         description="A portable, model-agnostic context database for AI agents",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
 
@@ -133,7 +133,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "version": "0.4.0"}
+        return {"status": "ok", "version": "0.5.0"}
 
     return app
 

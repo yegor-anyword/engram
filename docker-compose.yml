@@ -5,7 +5,7 @@ services:
       - "5820:5820"
     environment:
       ENGRAM_STORAGE_BACKEND: postgres
-      ENGRAM_POSTGRES_URL: postgresql://engram:engram@postgres:5432/engram
+      ENGRAM_POSTGRES_DSN: postgresql://engram:engram@postgres:5432/engram
       ENGRAM_LLM_MODEL: ${ENGRAM_LLM_MODEL:-anthropic/claude-sonnet-4-20250514}
       ENGRAM_LLM_API_KEY: ${ENGRAM_LLM_API_KEY:-}
       ENGRAM_EMBEDDING_MODEL: ${ENGRAM_EMBEDDING_MODEL:-text-embedding-3-small}

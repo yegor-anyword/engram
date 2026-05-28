@@ -122,7 +122,7 @@ ENGRAM_SQLITE_PATH=./engram.db
 
 # PostgreSQL for production (uncomment to use instead of SQLite)
 # ENGRAM_STORAGE_BACKEND=postgres
-# ENGRAM_POSTGRES_URL=postgresql://engram:password@localhost:5432/engram
+# ENGRAM_POSTGRES_DSN=postgresql://engram:password@localhost:5432/engram
 
 # ─── Server ─────────────────────────────────────────────────
 ENGRAM_HOST=0.0.0.0
@@ -865,7 +865,7 @@ All settings via environment variables or `.env` file:
 | **Database** | | |
 | `ENGRAM_STORAGE_BACKEND` | `sqlite` | `sqlite` or `postgres` |
 | `ENGRAM_SQLITE_PATH` | `./engram.db` | SQLite database path |
-| `ENGRAM_POSTGRES_URL` | — | PostgreSQL connection URL |
+| `ENGRAM_POSTGRES_DSN` | — | PostgreSQL connection string (DSN) |
 | **LLM API Keys** | | |
 | `ANTHROPIC_API_KEY` | — | For Reflector + Curator (server-side only) |
 | `OPENAI_API_KEY` | — | For embeddings (server-side only) |
