@@ -202,6 +202,7 @@ class PostgresBackend(StorageBackend):
                         target_model TEXT DEFAULT 'claude',
                         query TEXT,
                         timestamp TIMESTAMPTZ NOT NULL,
+                        reconsolidated_at TIMESTAMPTZ,
                         FOREIGN KEY (context_id) REFERENCES contexts(id) ON DELETE CASCADE
                     )
                 """)
@@ -379,6 +380,11 @@ class PostgresBackend(StorageBackend):
                 "ALTER TABLE activities ADD COLUMN raw_input_embedding TEXT"
             )
             logger.info("Added raw_input_embedding column to activities")
+        if not await self._column_exists(pool, "materializations", "reconsolidated_at"):
+            await pool.execute(
+                "ALTER TABLE materializations ADD COLUMN reconsolidated_at TIMESTAMPTZ"
+            )
+            logger.info("Added reconsolidated_at column to materializations")
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -479,9 +485,9 @@ class PostgresBackend(StorageBackend):
         lifecycle_json = context.lifecycle_config.model_dump_json()
         await pool.execute(
             "UPDATE contexts SET name=$1, description=$2, owner=$3, version=$4, "
-            "updated_at=$5, lifecycle_config=$6 WHERE id=$7",
+            "updated_at=$5, lifecycle_config=$6, core_memory=$7 WHERE id=$8",
             context.name, context.description, context.owner, context.version,
-            now, lifecycle_json, str(context.id),
+            now, lifecycle_json, context.core_memory, str(context.id),
         )
         context.updated_at = now
         return context
@@ -742,10 +748,11 @@ class PostgresBackend(StorageBackend):
         pool = await self._get_pool()
         await pool.execute(
             "INSERT INTO materializations (id, context_id, bullets_included, token_count, "
-            "target_model, query, timestamp) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "target_model, query, timestamp, reconsolidated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             record.id, record.context_id, json.dumps(record.bullets_included),
             record.token_count, record.target_model, record.query,
-            record.timestamp,
+            record.timestamp, record.reconsolidated_at,
         )
         return record
 
@@ -764,6 +771,18 @@ class PostgresBackend(StorageBackend):
             token_count=row["token_count"], target_model=row["target_model"],
             query=row["query"],
             timestamp=row["timestamp"],
+            reconsolidated_at=(
+                row["reconsolidated_at"] if "reconsolidated_at" in row.keys() else None
+            ),
+        )
+
+    async def mark_materialization_reconsolidated(
+        self, materialization_id: str, when: datetime,
+    ) -> None:
+        pool = await self._get_pool()
+        await pool.execute(
+            "UPDATE materializations SET reconsolidated_at = $1 WHERE id = $2",
+            when, materialization_id,
         )
 
     # ── Lifecycle Management (v0.3) ──────────────────────────────────

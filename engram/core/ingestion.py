@@ -23,7 +23,6 @@ from engram.core.delta import DeltaEngine
 from engram.core.events import EventBus
 from engram.core.exceptions import CapacityExceededError, IngestionError
 from engram.core.models import (
-    CORE_MEMORY_MAX_TOKENS,
     ActionType,
     Activity,
     Bullet,
@@ -38,6 +37,7 @@ from engram.core.models import (
     Reflection,
     ReflectionInsight,
     SourceType,
+    cap_core_memory,
 )
 from engram.llm.adapter import LLMAdapter
 from engram.storage.base import StorageBackend
@@ -49,22 +49,9 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _cap_core_memory(text: str, max_tokens: int = CORE_MEMORY_MAX_TOKENS) -> str:
-    """Truncate core memory text to a token budget. Uses tiktoken when available,
-    otherwise falls back to ~4 chars/token. Truncation is on token boundaries so
-    we never emit a half-decoded codepoint."""
-    if not text:
-        return ""
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        toks = enc.encode(text)
-        if len(toks) <= max_tokens:
-            return text
-        return enc.decode(toks[:max_tokens])
-    except Exception:
-        char_budget = max_tokens * 4
-        return text if len(text) <= char_budget else text[:char_budget]
+# Core-memory capping now lives in engram.core.models.cap_core_memory so it can
+# be enforced at the delta-apply layer too (single source of truth for the bound).
+_cap_core_memory = cap_core_memory
 
 
 # ── Reflector ──────────────────────────────────────────────────────────────
@@ -399,6 +386,16 @@ class CuratorEngine:
         if not rejected_judge_indices:
             return ops
 
+        # Surface the case where the gate rejected every candidate write — an
+        # over-aggressive or misconfigured judge can otherwise silently swallow
+        # a whole commit's worth of knowledge with no operator-visible signal.
+        if len(rejected_judge_indices) == len(add_ops_with_idx):
+            logger.warning(
+                "Validity gate (%s) rejected ALL %d candidate bullet(s); "
+                "this commit will add no bullets",
+                gate_model, len(add_ops_with_idx),
+            )
+
         rejected_op_positions = {
             add_ops_with_idx[j][0] for j in rejected_judge_indices
         }
@@ -422,10 +419,15 @@ class CuratorEngine:
                 logger.debug("Skipping exact duplicate: %s", insight.content[:60])
                 return None
 
-        # Fast path: embedding similarity → merge.
+        # Fast path: embedding similarity → fold the new insight into the
+        # existing bullet (UPDATE_BULLET). The new insight is not yet a stored
+        # bullet, so a MERGE_BULLETS over two existing ids cannot represent it —
+        # we update the survivor in place, keeping the richer content and its
+        # accumulated usage stats.
         # Episodic bullets use a looser threshold (multiple agents often log
         # paraphrases of the same event) AND merge only against same-type
         # episodics — a paraphrased event should never collapse into a fact.
+        embedding: list[float] | None = None
         try:
             embedding = await self.llm.embed(insight.content)
             threshold = 0.85 if is_episodic else 0.92
@@ -440,12 +442,18 @@ class CuratorEngine:
                 ]
             if similar:
                 existing_bullet, score = similar[0]
-                logger.debug("Found similar bullet (%.3f): merging", score)
+                # Keep the more specific (longer) phrasing of the two.
+                merged_content = (
+                    insight.content
+                    if len(insight.content) > len(existing_bullet.content)
+                    else existing_bullet.content
+                )
+                logger.debug("Found similar bullet (%.3f): folding into existing", score)
                 return DeltaOperation(
-                    op_type=DeltaOpType.MERGE_BULLETS,
-                    target_ids=[existing_bullet.id, "__new__"],
-                    content=insight.content if len(insight.content) > len(existing_bullet.content) else existing_bullet.content,
-                    reasoning=f"Merged similar bullet (cosine={score:.3f})",
+                    op_type=DeltaOpType.UPDATE_BULLET,
+                    target_id=existing_bullet.id,
+                    content=merged_content,
+                    reasoning=f"Merged similar insight into existing bullet (cosine={score:.3f})",
                     source=DeltaSource.CURATOR,
                     confidence=max(existing_bullet.confidence, insight.novelty),
                     agent_id=agent_id,
@@ -457,7 +465,7 @@ class CuratorEngine:
         # Fast path: contradiction detection — skip for episodic since each
         # event is its own atomic record, not a competing claim.
         try:
-            if embedding is not None and not is_episodic:  # type: ignore[possibly-undefined]
+            if embedding is not None and not is_episodic:
                 contradiction = self._detect_contradiction(
                     insight.content, embedding, existing_bullets
                 )
@@ -986,6 +994,17 @@ class IngestionEngine:
             logger.warning("Materialization %s not found for reconsolidation", materialization_id)
             return None
 
+        # Idempotency: a materialization may be reconsolidated exactly once.
+        # Without this, a replayed materialization_id (retry, at-least-once
+        # delivery, or two commits citing one recall) double-counts hits and
+        # compounds salience.
+        if record.reconsolidated_at is not None:
+            logger.info(
+                "Materialization %s already reconsolidated at %s; skipping replay",
+                materialization_id, record.reconsolidated_at,
+            )
+            return None
+
         # Decide the per-bullet effect from the outcome once.
         if feedback.outcome == FeedbackOutcome.SUCCESS:
             recall_delta, hit_delta, miss_delta, mult = 1, 1, 0, 1.05
@@ -1027,9 +1046,24 @@ class IngestionEngine:
         )
         if self.lock_manager is not None:
             async with self.lock_manager.acquire(record.context_id):
+                # Re-check under the lock so two concurrent replays can't both
+                # pass the pre-lock idempotency guard and double-apply.
+                fresh = await self.storage.get_materialization(materialization_id)
+                if fresh is not None and fresh.reconsolidated_at is not None:
+                    logger.info(
+                        "Materialization %s reconsolidated concurrently; skipping",
+                        materialization_id,
+                    )
+                    return None
                 batch = await self.delta_engine.apply_batch(batch)
+                await self.storage.mark_materialization_reconsolidated(
+                    materialization_id, _utcnow(),
+                )
         else:
             batch = await self.delta_engine.apply_batch(batch)
+            await self.storage.mark_materialization_reconsolidated(
+                materialization_id, _utcnow(),
+            )
 
         logger.info(
             "Reconsolidation: %d bullets updated from materialization %s (outcome=%s)",

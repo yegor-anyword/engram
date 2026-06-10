@@ -165,6 +165,7 @@ class SQLiteBackend(StorageBackend):
                 target_model TEXT DEFAULT 'claude',
                 query TEXT,
                 timestamp TEXT NOT NULL,
+                reconsolidated_at TEXT,
                 FOREIGN KEY (context_id) REFERENCES contexts(id) ON DELETE CASCADE
             );
 
@@ -307,6 +308,14 @@ class SQLiteBackend(StorageBackend):
             )
             logger.info("Added raw_input_embedding column to activities")
 
+        cursor = await db.execute("PRAGMA table_info(materializations)")
+        mat_cols = {row[1] for row in await cursor.fetchall()}
+        if "reconsolidated_at" not in mat_cols:
+            await db.execute(
+                "ALTER TABLE materializations ADD COLUMN reconsolidated_at TEXT"
+            )
+            logger.info("Added reconsolidated_at column to materializations")
+
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
@@ -403,9 +412,9 @@ class SQLiteBackend(StorageBackend):
         lifecycle_json = context.lifecycle_config.model_dump_json()
         await db.execute(
             "UPDATE contexts SET name=?, description=?, owner=?, version=?, "
-            "updated_at=?, lifecycle_config=? WHERE id=?",
+            "updated_at=?, lifecycle_config=?, core_memory=? WHERE id=?",
             (context.name, context.description, context.owner, context.version,
-             now, lifecycle_json, str(context.id)),
+             now, lifecycle_json, context.core_memory, str(context.id)),
         )
         await db.commit()
         context.updated_at = datetime.fromisoformat(now)
@@ -657,10 +666,12 @@ class SQLiteBackend(StorageBackend):
         db = await self._get_db()
         await db.execute(
             "INSERT INTO materializations (id, context_id, bullets_included, token_count, "
-            "target_model, query, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "target_model, query, timestamp, reconsolidated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (record.id, record.context_id, json.dumps(record.bullets_included),
              record.token_count, record.target_model, record.query,
-             record.timestamp.isoformat()),
+             record.timestamp.isoformat(),
+             record.reconsolidated_at.isoformat() if record.reconsolidated_at else None),
         )
         await db.commit()
         return record
@@ -673,13 +684,26 @@ class SQLiteBackend(StorageBackend):
         row = await cursor.fetchone()
         if row is None:
             return None
+        keys = row.keys()
+        rec_at = row["reconsolidated_at"] if "reconsolidated_at" in keys else None
         return MaterializationRecord(
             id=row["id"], context_id=row["context_id"],
             bullets_included=json.loads(row["bullets_included"]),
             token_count=row["token_count"], target_model=row["target_model"],
             query=row["query"],
             timestamp=datetime.fromisoformat(row["timestamp"]),
+            reconsolidated_at=datetime.fromisoformat(rec_at) if rec_at else None,
         )
+
+    async def mark_materialization_reconsolidated(
+        self, materialization_id: str, when: datetime,
+    ) -> None:
+        db = await self._get_db()
+        await db.execute(
+            "UPDATE materializations SET reconsolidated_at = ? WHERE id = ?",
+            (when.isoformat(), materialization_id),
+        )
+        await db.commit()
 
     # ── Lifecycle Management (v0.3) ──────────────────────────────────
 

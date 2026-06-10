@@ -21,6 +21,7 @@ import uuid
 import pytest
 
 from engram.core.config import IngestionConfig
+from engram.core.delta import DeltaEngine
 from engram.core.ingestion import (
     CuratorEngine,
     IngestionEngine,
@@ -128,10 +129,26 @@ async def test_episodic_merges_at_loose_threshold(storage, context_id):
     )
     reflection = Reflection(new_insights=[insight], confidence=0.7)
     batch = await curator.curate(str(context_id), reflection)
-    # Expect a MERGE_BULLETS op, not a new ADD_BULLET.
+    # The near-duplicate episodic folds into the existing bullet via UPDATE_BULLET
+    # (not a no-op MERGE over a non-existent "__new__" target, and not a new ADD).
     op_types = [op.op_type for op in batch.operations]
-    assert DeltaOpType.MERGE_BULLETS in op_types
+    assert DeltaOpType.UPDATE_BULLET in op_types
     assert DeltaOpType.ADD_BULLET not in op_types
+
+    update_op = next(op for op in batch.operations
+                     if op.op_type == DeltaOpType.UPDATE_BULLET)
+    assert update_op.target_id == seeded.id
+
+    # Storage-state assertion (the gap that let the inert-merge bug hide):
+    # apply the batch and confirm the new insight was actually persisted —
+    # exactly one bullet remains, carrying the richer (longer) content.
+    engine = DeltaEngine(storage)
+    await engine.apply_batch(batch)
+    bullets = await storage.list_bullets(str(context_id))
+    assert len(bullets) == 1
+    assert bullets[0].id == seeded.id
+    # The longer phrasing wins ("...said yes..." is longer than "...agreed...").
+    assert bullets[0].content == "At 14:30 user said yes PaddleOCR"
 
 
 async def test_fact_does_not_merge_at_same_threshold(storage, context_id):
@@ -162,9 +179,10 @@ async def test_fact_does_not_merge_at_same_threshold(storage, context_id):
     reflection = Reflection(new_insights=[insight], confidence=0.7)
     batch = await curator.curate(str(context_id), reflection)
     op_types = [op.op_type for op in batch.operations]
-    # Not merged; should be added as new (cos 0.88 < 0.92 fact threshold).
+    # Not merged/folded; should be added as new (cos 0.88 < 0.92 fact threshold).
     assert DeltaOpType.ADD_BULLET in op_types
     assert DeltaOpType.MERGE_BULLETS not in op_types
+    assert DeltaOpType.UPDATE_BULLET not in op_types
 
 
 # ── 4. Episodic doesn't collapse into a same-topic non-episodic ──────────────
@@ -197,10 +215,11 @@ async def test_episodic_doesnt_merge_with_non_episodic(storage, context_id):
     reflection = Reflection(new_insights=[insight], confidence=0.7)
     batch = await curator.curate(str(context_id), reflection)
 
-    # Episodic stays separate — added, not merged into the fact.
+    # Episodic stays separate — added, not merged/folded into the fact.
     op_types = [op.op_type for op in batch.operations]
     assert DeltaOpType.ADD_BULLET in op_types
     assert DeltaOpType.MERGE_BULLETS not in op_types
+    assert DeltaOpType.UPDATE_BULLET not in op_types
 
 
 # ── 5. Contradiction detection skipped for episodic ──────────────────────────

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import uuid
+from datetime import datetime
 from typing import Any
 
 from engram.core.models import (
@@ -159,6 +160,12 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def get_materialization(self, materialization_id: str) -> MaterializationRecord | None:
         """Get a materialization record by ID."""
+
+    @abc.abstractmethod
+    async def mark_materialization_reconsolidated(
+        self, materialization_id: str, when: datetime,
+    ) -> None:
+        """Stamp a materialization as reconsolidated so replays are no-ops."""
 
     # ── Lifecycle Management (v0.3) ─────────────────────────────────
 

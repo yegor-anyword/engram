@@ -23,6 +23,7 @@ from engram.core.models import (
     DeltaSource,
     SchemaNode,
     SourceType,
+    cap_core_memory,
 )
 from engram.storage.base import StorageBackend
 
@@ -267,13 +268,17 @@ class DeltaEngine:
         """
         if op.content is None:
             return
+        # Enforce the ≤512-token bound here, at the canonical mutation point, so
+        # it holds for every caller of the delta op — not just the ingestion
+        # commit path. cap_core_memory is idempotent on already-capped text.
+        capped = cap_core_memory(op.content)
         try:
             ctx = await self.storage.get_context(uuid.UUID(context_id))
         except (ValueError, AttributeError):
             ctx = None
         if ctx is not None and op.rollback_state is None:
             op.rollback_state = {"core_memory": ctx.core_memory}
-        await self.storage.update_core_memory(context_id, op.content)
+        await self.storage.update_core_memory(context_id, capped)
 
     async def _apply_reconsolidate_bullet(self, op: DeltaOperation) -> None:
         """Audit-clean reconsolidation: update a bullet's usage stats and salience.
@@ -288,6 +293,15 @@ class DeltaEngine:
             return
         bullet = await self.storage.get_bullet(op.target_id)
         if bullet is None:
+            return
+        # Don't reinforce a bullet that was archived or deactivated between the
+        # materialization and this feedback commit — get_bullet returns rows
+        # regardless of lifecycle state, so revalidate here.
+        if not bullet.is_active or bullet.is_archived:
+            logger.debug(
+                "Skipping reconsolidation of inactive/archived bullet %s",
+                op.target_id,
+            )
             return
         deltas = op.previous_state
         if op.rollback_state is None:

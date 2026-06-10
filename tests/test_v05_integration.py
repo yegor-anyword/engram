@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import zlib
 import math
 import uuid
 
@@ -58,9 +59,13 @@ class ScriptedLLM(LLMAdapter):
             ) from e
 
     async def embed(self, text):
+        # Use a stable hash (not builtin hash(), which is randomized per process
+        # via PYTHONHASHSEED) so worked-example cosine similarity is reproducible
+        # across runs — otherwise the 0.5-threshold assertion below is flaky.
         vec = [0.0] * 64
         for w in text.lower().split():
-            vec[hash(w) % 64] += 1.0
+            bucket = zlib.crc32(w.encode("utf-8")) % 64
+            vec[bucket] += 1.0
         n = math.sqrt(sum(x * x for x in vec)) or 1.0
         return [x / n for x in vec]
 

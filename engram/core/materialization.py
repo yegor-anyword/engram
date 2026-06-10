@@ -56,6 +56,20 @@ def _utcnow() -> datetime:
 # relevance candidates keeps the loop O(K^2) instead of O(N^2) on large contexts.
 MMR_CANDIDATE_CAP = 64
 
+# Worked examples are drawn from raw activity inputs, which are unbounded in
+# length. Cap each example's input/output so the <worked_examples> block (which
+# renderers append after the budgeted bullet packing) can't blow the token
+# budget on a single large prior input. ~800 chars ≈ 200 tokens per field.
+WORKED_EXAMPLE_INPUT_MAX_CHARS = 800
+WORKED_EXAMPLE_OUTPUT_MAX_CHARS = 800
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    """Truncate to a char budget with an ellipsis marker when cut."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + " …[truncated]"
+
 
 def _mmr_order(
     bullets: list[Bullet],
@@ -548,8 +562,8 @@ class MaterializationEngine:
                     )
                     bullets_text = ""
             examples.append({
-                "input": activity.raw_input,
-                "output": bullets_text,
+                "input": _truncate(activity.raw_input, WORKED_EXAMPLE_INPUT_MAX_CHARS),
+                "output": _truncate(bullets_text, WORKED_EXAMPLE_OUTPUT_MAX_CHARS),
                 "similarity": f"{sim:.2f}",
             })
         return examples

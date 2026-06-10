@@ -361,6 +361,9 @@ class MaterializationRecord(BaseModel):
     target_model: str = "claude"
     query: str | None = None
     timestamp: datetime = Field(default_factory=_utcnow)
+    # v0.5: set once the recall has been reconsolidated, so a replayed
+    # materialization_id (retry, at-least-once delivery) can't double-count.
+    reconsolidated_at: datetime | None = None
 
 
 # ── Consolidation ─────────────────────────────────────────────────────────
@@ -572,6 +575,29 @@ class Activity(BaseModel):
 CORE_MEMORY_MAX_TOKENS = 512  # Mem-α: bounded always-in-context summary slot.
 
 
+def cap_core_memory(text: str, max_tokens: int = CORE_MEMORY_MAX_TOKENS) -> str:
+    """Truncate core memory text to a token budget. Uses tiktoken when available,
+    otherwise falls back to ~4 chars/token. Truncation is on token boundaries so
+    we never emit a half-decoded codepoint.
+
+    This is the single enforcement point for the ≤512-token core-memory invariant;
+    it is called both by the ingestion commit path and by the UPDATE_CORE_MEMORY
+    delta apply, so the bound holds for every writer of the delta op.
+    """
+    if not text:
+        return ""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        toks = enc.encode(text)
+        if len(toks) <= max_tokens:
+            return text
+        return enc.decode(toks[:max_tokens])
+    except Exception:
+        char_budget = max_tokens * 4
+        return text if len(text) <= char_budget else text[:char_budget]
+
+
 class Context(BaseModel):
     """Top-level container holding an intent anchor, concept graph, and activity ledger."""
 
@@ -719,15 +745,15 @@ class MaterializeRequest(BaseModel):
 
     # v0.5: DC-inspired retrieval of nearest prior raw inputs as worked examples.
     include_worked_examples: bool = True
-    worked_example_threshold: float = 0.85
-    worked_example_limit: int = 2
+    worked_example_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    worked_example_limit: int = Field(default=2, ge=0)
 
     # v0.5: surface per-bullet usage stats in the rendered text (Phase 5).
     include_usage_stats: bool = False
 
     # v0.5: MMR diversity λ in materialization ranking. 1.0 = relevance only
     # (legacy greedy behavior); 0.7 mixes in diversity (the default).
-    mmr_lambda: float = 0.7
+    mmr_lambda: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
 class MaterializeResponse(BaseModel):
