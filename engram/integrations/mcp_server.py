@@ -286,6 +286,25 @@ def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
                     "properties": {},
                 },
             ),
+            Tool(
+                name="consolidate",
+                description=(
+                    "Run the consolidation engine (sleep cycle) on a context: forgetting-curve "
+                    "decay → semantic dedup → schema induction → archive stale → purge expired "
+                    "→ promote repeated facts to principles. Engram has NO scheduler, so nothing "
+                    "decays/dedups/promotes until this runs. Safe to run periodically (daily)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "context_id": {
+                            "type": "string",
+                            "description": "UUID of the context to consolidate",
+                        },
+                    },
+                    "required": ["context_id"],
+                },
+            ),
             # ── engram_ prefixed tools (v0.4.1) ────────────────────────
             # These are the canonical tool names for the app.engram.so MCP spec.
             # They map to the same handlers as the original tools above.
@@ -459,6 +478,25 @@ def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
                         },
                     },
                     "required": ["name", "objective", "success_criteria"],
+                },
+            ),
+            Tool(
+                name="engram_consolidate",
+                description=(
+                    "Run the consolidation engine (sleep cycle) on an Engram context: "
+                    "forgetting-curve decay, semantic dedup, schema induction, archive "
+                    "stale bullets, purge expired archives, and promote repeated facts to "
+                    "principles. No scheduler exists — consolidation only runs when triggered."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "context_id": {
+                            "type": "string",
+                            "description": "ID of the context to consolidate",
+                        },
+                    },
+                    "required": ["context_id"],
                 },
             ),
         ]
@@ -726,6 +764,22 @@ def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
                         )
                     ]
 
+                case "consolidate" | "engram_consolidate":
+                    report = await client.consolidate(
+                        context_id=arguments["context_id"],
+                    )
+                    lines = [
+                        f"Consolidated {arguments['context_id']} [{report.get('mode', 'normal')}]:",
+                        f"  decayed={report.get('decayed', 0)}  "
+                        f"deduped={report.get('deduplicated', 0)}  "
+                        f"schemas={report.get('schemas_formed', 0)}  "
+                        f"archived={report.get('archived', 0)}  "
+                        f"purged={report.get('purged', 0)}  "
+                        f"promoted={report.get('promoted', 0)}",
+                        f"  took {report.get('duration_ms', 0)}ms",
+                    ]
+                    return [TextContent(type="text", text="\n".join(lines))]
+
                 case _:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
         except Exception as exc:
@@ -745,3 +799,10 @@ async def run_mcp_server(engram_url: str = "http://localhost:5820") -> None:
     server = create_mcp_server(engram_url)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+if __name__ == "__main__":
+    import os
+
+    url = os.environ.get("ENGRAM_API_URL", "http://localhost:5820")
+    asyncio.run(run_mcp_server(url))
