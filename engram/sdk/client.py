@@ -46,7 +46,7 @@ class Engram:
         self,
         url: str = "http://localhost:5820",
         api_key: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 120.0,
     ) -> None:
         headers: dict[str, str] = {}
         if api_key:
@@ -545,7 +545,7 @@ class Engram:
         """Update server-level ingestion configuration.
 
         Pass keyword arguments for fields to update, e.g.:
-            await engram.update_ingestion_config(reflector_model="claude-sonnet-4-20250514")
+            await engram.update_ingestion_config(reflector_model="claude-sonnet-4-6")
         """
         resp = await self._client.put("/config/ingestion", json=kwargs)
         resp.raise_for_status()

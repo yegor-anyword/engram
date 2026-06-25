@@ -42,7 +42,7 @@ class LiteLLMAdapter(LLMAdapter):
 
     def __init__(
         self,
-        model: str = "anthropic/claude-sonnet-4-20250514",
+        model: str = "anthropic/claude-sonnet-4-6",
         api_key: str | None = None,
         embedding_model: str = "text-embedding-3-small",
         embedding_api_key: str | None = None,

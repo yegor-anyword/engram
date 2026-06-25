@@ -267,7 +267,7 @@ def create_mcp_server(engram_url: str = "http://localhost:5820") -> Any:
                         },
                         "reflector_model": {
                             "type": "string",
-                            "description": "New Reflector model to use (e.g., 'claude-sonnet-4-20250514')",
+                            "description": "New Reflector model to use (e.g., 'claude-sonnet-4-6')",
                         },
                         "dry_run": {
                             "type": "boolean",

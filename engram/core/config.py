@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     # PostgreSQL settings (used when storage_backend = "postgres")
     postgres_dsn: str = ""
 
-    llm_model: str = "anthropic/claude-sonnet-4-20250514"
+    llm_model: str = "anthropic/claude-sonnet-4-6"
     llm_api_key: str = ""
 
     embedding_model: str = "text-embedding-3-small"

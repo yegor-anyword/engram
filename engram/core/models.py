@@ -866,7 +866,7 @@ class EngineConfig(BaseModel):
     storage_backend: str = "sqlite"
     sqlite_path: str = "./engram.db"
     postgres_url: str = "postgresql://engram:engram@localhost:5432/engram"
-    llm_model: str = "anthropic/claude-sonnet-4-20250514"
+    llm_model: str = "anthropic/claude-sonnet-4-6"
     llm_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
     embedding_api_key: str = ""
